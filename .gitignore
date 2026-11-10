@@ -1,0 +1,9 @@
+.gradle/
+.kotlin/
+.idea/
+local.properties
+**/build/
+*.iml
+*.jks
+*.keystore
+!signing/wifi-test.keystore
