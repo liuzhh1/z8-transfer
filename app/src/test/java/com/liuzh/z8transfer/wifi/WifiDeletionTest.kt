@@ -56,13 +56,16 @@ class WifiDeletionTest {
         }
     }
     private fun fixture(protected: Boolean = false, changed: Boolean = false, volume: String = "card", supports: Boolean = true, deleteCode: Int = 0x2001): Fixture {
-        val guid = ByteArray(16)
-        val ack = frame(2, le(4).putInt(7).array() + guid + "Z8\u0000".toByteArray(Charsets.UTF_16LE) + le(4).putInt(0x10000).array())
         val card = le(26).putShort(3).putShort(2).putShort(0).putLong(1000).putLong(500).putInt(50).array() + string("CF") + string(volume)
         val info = le(52).putInt(1).putShort(0x3801).putShort(if (protected) 1 else 0).putInt(if (changed) 900 else 100)
             .putShort(0).putInt(0).putInt(0).putInt(0).putInt(0).putInt(0).putInt(0).putInt(42).putShort(0).putInt(0).putInt(0).array() +
             string("A.JPG") + string("") + string("")
-        val command = FakeSocket(ByteArrayInputStream(ack + response(0) + data(1, card) + data(2, info) + response(3, deleteCode)))
+        return wireFixture(data(1, card) + data(2, info) + response(3, deleteCode), if (supports) setOf(0x100b) else emptySet())
+    }
+    private fun wireFixture(replies: ByteArray, operations: Set<Int>): Fixture {
+        val guid = ByteArray(16)
+        val ack = frame(2, le(4).putInt(7).array() + guid + "Z8\u0000".toByteArray(Charsets.UTF_16LE) + le(4).putInt(0x10000).array())
+        val command = FakeSocket(ByteArrayInputStream(ack + response(0) + replies))
         val event = FakeSocket(SequenceInputStream(Collections.enumeration(listOf(ByteArrayInputStream(frame(4)), Idle()))))
         val sockets = ArrayDeque(listOf(command, event))
         val protocol = PtpIpProtocol.connect(guid, "test") { sockets.removeFirst() }
@@ -71,7 +74,7 @@ class WifiDeletionTest {
         val routeCtor = WifiRoute::class.java.declaredConstructors.first { it.parameterCount == 3 }.apply { isAccessible = true }
         val route = routeCtor.newInstance(context.getSystemService(ConnectivityManager::class.java), ShadowNetwork.newInstance(108), WifiEndpoint("192.168.1.1")) as WifiRoute
         val ctor = WifiPtpTransport::class.java.declaredConstructors.first { it.parameterCount == 6 }.apply { isAccessible = true }
-        val source = ctor.newInstance(route, protocol, "Z8", "identity", if (supports) setOf(0x100b) else emptySet<Int>(), "") as WifiPtpTransport
+        val source = ctor.newInstance(route, protocol, "Nikon Z8", "identity", operations, "") as WifiPtpTransport
         return Fixture(source, protocol, command)
     }
     private fun photo(source: WifiPtpTransport) = CameraPhoto(source.sessionId, "identity", 1, "card:1000", "CF", 77,
@@ -103,4 +106,16 @@ class WifiDeletionTest {
             assertEquals(1, f.commands().count { it.first == 0x100b })
         }
     }
+    @Test fun wirelessRemoteCommandsUseAdvertisedCapabilitiesAndExactCardCaptureParameters() = runTest {
+        val jpeg = byteArrayOf(-1,-40,-1,-32,0,2,-1,-39)
+        wireFixture(response(1) + data(2, ByteArray(384) + jpeg) + response(3) + response(4),
+            setOf(0x9201,0x9202,0x9203,0x9207)).use { f ->
+            val remote = f.source.remoteControl!!
+            assertEquals(RemoteCapabilities(true,true,false),remote.capabilities)
+            remote.startLiveView(); assertArrayEquals(jpeg,remote.frame())
+            remote.capture(false) {}; remote.close()
+            assertEquals(listOf(0x9201 to emptyList<Int>(),0x9203 to emptyList(),0x9207 to listOf(-1,0),0x9202 to emptyList()),f.commands())
+        }
+    }
+
 }

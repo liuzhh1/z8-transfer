@@ -6,6 +6,11 @@ import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import com.liuzh.z8transfer.core.NikonFocusMetadata
 import com.liuzh.z8transfer.core.FocusRegion
+import com.liuzh.z8transfer.core.RemoteCapabilities
+import com.liuzh.z8transfer.core.RemoteStatus
+import com.liuzh.z8transfer.core.RemoteAction
+import com.liuzh.z8transfer.core.RemoteSession
+import android.os.SystemClock
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.util.LruCache
@@ -64,10 +69,13 @@ data class AppState(
     val supportsDeletion: Boolean = false,
     val connectionLabel: String = "USB",
     val deletionUnavailableReason: String = "当前相机连接未声明支持删除",
+    val remoteCapabilities: RemoteCapabilities = RemoteCapabilities(),
+    val remoteUnavailableReason: String = "连接相机后检查遥控能力",
+    val remote: RemoteUiState = RemoteUiState(),
     val usbMode: UsbConnectionMode = UsbConnectionMode.SYSTEM_MTP,
 ) {
     val connected: Boolean get() = cameraName != null
-    val busy: Boolean get() = connecting || scanning || progress.running || deletion.running
+    val busy: Boolean get() = connecting || scanning || progress.running || deletion.running || remote.open
 }
 
 class AppController(context: Context) {
@@ -81,6 +89,9 @@ class AppController(context: Context) {
     @Volatile private var transport: CameraTransport? = null
     private var scanJob: Job? = null
     private var downloadJob: Job? = null
+    private var remoteJob: Job? = null
+    @Volatile private var remoteSession: RemoteSession? = null
+    private val remoteCaptured = AtomicBoolean(false)
     private var queued: List<CameraPhoto> = emptyList()
     private var queuedDeletion: DeletionPlan? = null
     private var cleanupJob: Job? = null
@@ -149,6 +160,8 @@ class AppController(context: Context) {
                 }
                 mutableState.update { it.copy(cameraName = opened.displayName, diagnostics = opened.diagnostics, connecting = false,
                     supportsDeletion = opened.supportsDeletion, connectionLabel = opened.connectionLabel,
+                    remoteCapabilities = opened.remoteControl?.capabilities ?: RemoteCapabilities(),
+                    remoteUnavailableReason = opened.remoteUnavailableReason, remote = RemoteUiState(),
                     deletionUnavailableReason = opened.deletionUnavailableReason, error = null) }
                 refresh()
             } catch (cancelled: CancellationException) {
@@ -160,13 +173,16 @@ class AppController(context: Context) {
         }
     }
 
-    fun refresh() {
+    fun refresh() = scanCamera(false)
+
+    private fun scanCamera(preserveSelection: Boolean) {
         val source = transport ?: return
         if (state.value.busy || !source.attached) return
         scanJob?.cancel()
         scanGeneration++
         thumbnailCache.evictAll()
-        mutableState.update { it.copy(scanning = true, examined = 0, photos = emptyList(), selected = emptySet(), downloaded = emptySet(), error = null) }
+        mutableState.update { it.copy(scanning = true, examined = 0, photos = emptyList(), selected = if (preserveSelection) it.selected else emptySet(),
+            downloaded = if (preserveSelection) it.downloaded else emptySet(), error = null) }
         scanJob = scope.launch {
             try {
                 source.scan(onBatch = { batch ->
@@ -174,7 +190,10 @@ class AppController(context: Context) {
                         old.copy(photos = (old.photos + batch).sortedWith(compareByDescending<CameraPhoto> { it.sortTime }.thenBy { it.name }))
                     }
                 }, onExamined = { count -> mutableState.update { it.copy(examined = count) } })
-                mutableState.update { it.copy(scanning = false) }
+                mutableState.update { current ->
+                    val keys = current.photos.map { it.key }.toSet()
+                    current.copy(scanning = false, selected = current.selected.intersect(keys), downloaded = current.downloaded.intersect(keys))
+                }
                 // Check the local copy before displaying a downloaded badge.
                 for (photo in state.value.photos) {
                     ensureActive()
@@ -192,6 +211,7 @@ class AppController(context: Context) {
 
     fun disconnect() {
         if (state.value.progress.running || state.value.deletion.running || state.value.connecting) return
+        if (state.value.remote.open) { closeRemote(); return }
         val previous = transport
         previous?.markDetached()
         transport = null
@@ -213,9 +233,84 @@ class AppController(context: Context) {
         stop.set(true)
         transport = null
         scanJob?.cancel()
-        mutableState.update { it.copy(cameraName = null, scanning = false, photos = emptyList(), selected = emptySet(), downloaded = emptySet(),
+        remoteJob?.cancel(); remoteSession = null
+        mutableState.update { it.copy(cameraName = null, remote = RemoteUiState(), remoteCapabilities = RemoteCapabilities(), scanning = false, photos = emptyList(), selected = emptySet(), downloaded = emptySet(),
             supportsDeletion = false, error = message) }
         cleanupJob = scope.launch { previous.close() }
+    }
+
+    fun openRemote() {
+        val source = transport ?: return
+        val camera = source.remoteControl
+        if (state.value.busy || !source.attached) return
+        if (camera == null || !camera.capabilities.available) { showError(source.remoteUnavailableReason); return }
+        remoteCaptured.set(false)
+        val session = RemoteSession(camera)
+        remoteSession = session
+        mutableState.update { it.copy(remote = RemoteUiState(open = true, pending = true)) }
+        remoteJob = scope.launch(Dispatchers.IO) {
+            var frames = 0L
+            var windowFrames = 0L
+            var windowStart = SystemClock.elapsedRealtime()
+            try {
+                session.run(onState = { status ->
+                    if (source !== transport) throw CancellationException("遥控连接已结束")
+                    if (source === transport && state.value.remote.open) mutableState.update { current ->
+                        current.copy(remote = current.remote.copy(status = status, pending = false))
+                    }
+                    if (!source.attached && source === transport) invalidateConnection(source)
+                }, onFrame = { bytes ->
+                    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                    check(bounds.outWidth in 1..8192 && bounds.outHeight in 1..8192 &&
+                        bounds.outWidth.toLong() * bounds.outHeight <= 24_000_000) { "相机实时画面尺寸无效" }
+                    var sample = 1
+                    while (maxOf(bounds.outWidth, bounds.outHeight) / sample > 2048) sample *= 2
+                    val image = BitmapFactory.decodeByteArray(bytes, 0, bytes.size,
+                        BitmapFactory.Options().apply { inSampleSize = sample }) ?: error("实时画面无法解码")
+                    frames++; windowFrames++
+                    val now = SystemClock.elapsedRealtime()
+                    val elapsed = now - windowStart
+                    if (source === transport && state.value.remote.open && !state.value.remote.closing) {
+                        mutableState.update { current -> current.copy(remote = current.remote.copy(frame = image,
+                            frameNumber = frames, receivedAt = now,
+                            fps = if (elapsed >= 1000) windowFrames * 1000.0 / elapsed else current.remote.fps)) }
+                    }
+                    if (elapsed >= 1000) { windowFrames = 0; windowStart = now }
+                }, onAccepted = { remoteCaptured.set(true) }, onCleanupFailure = { error ->
+                    if (source === transport) onConnectionLost(source, "结束相机遥控未确认，请重新连接并检查相机状态：${error.message}")
+                })
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) {
+                if (source === transport) mutableState.update { current -> current.copy(remote = current.remote.copy(
+                    pending = false, status = RemoteStatus(error = error.message ?: "相机遥控中断"))) }
+                if (!source.attached && source === transport) invalidateConnection(source)
+            }
+        }
+    }
+
+    fun remoteAction(action: RemoteAction) {
+        val current = state.value.remote
+        if (!current.open || current.busy || action is RemoteAction.Capture && current.status.captureBlocked) return
+        mutableState.update { it.copy(remote = it.remote.copy(pending = true)) }
+        if (remoteSession?.submit(action) == true) {
+            if (action is RemoteAction.Capture) remoteCaptured.set(true)
+        } else mutableState.update { it.copy(remote = it.remote.copy(pending = false)) }
+    }
+
+    fun closeRemote() {
+        if (!state.value.remote.open || state.value.remote.closing) return
+        val source = transport
+        val job = remoteJob
+        mutableState.update { it.copy(remote = it.remote.copy(closing = true)) }
+        scope.launch {
+            job?.cancelAndJoin()
+            if (source === transport) {
+                remoteJob = null; remoteSession = null
+                mutableState.update { it.copy(remote = RemoteUiState()) }
+                if (remoteCaptured.getAndSet(false) && source?.attached == true) scanCamera(true)
+            }
+        }
     }
 
     fun toggle(photo: CameraPhoto) {

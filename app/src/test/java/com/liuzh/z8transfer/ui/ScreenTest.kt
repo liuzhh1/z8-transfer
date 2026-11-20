@@ -288,6 +288,94 @@ class ScreenTest {
         compose.onNodeWithText("永久删除 1 个文件").assertIsNotEnabled()
     }
 
+    @Test fun previewDeleteShowsConfirmationAndCanIncludeCompanionJpeg() {
+        val raw = photo(); val jpeg = photo(2, "DSC_0001.JPG", PhotoKind.JPEG)
+        val next = photo(3, "DSC_0002.JPG", PhotoKind.JPEG)
+        var state by mutableStateOf(connected(listOf(raw, jpeg, next)))
+        var removed = emptyList<CameraPhoto>()
+        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, {}, {}, {}, { null },
+            onDelete = { plan -> removed = plan.files; state = state.copy(photos = state.photos.filterNot { p -> p.key in plan.files.map { it.key } }) }) } }
+        compose.onNodeWithText("DSC_0001.NEF").performClick()
+        compose.onNodeWithText("删除此文件").assertIsEnabled().performClick()
+        compose.onNodeWithText("永久删除 1 个文件").assertIsNotEnabled()
+        assertTrue(removed.isEmpty())
+        compose.onNodeWithContentDescription("同时删除同名 JPEG").performClick()
+        compose.onNodeWithContentDescription("确认永久删除相机原文件").performClick()
+        snapshot("v050-preview-delete")
+        compose.onNodeWithText("永久删除 2 个文件").performClick()
+        assertEquals(listOf(raw,jpeg),removed)
+        compose.onNodeWithTag("full-media-viewer").assertIsDisplayed()
+        compose.onNode(hasText("DSC_0002.JPG") and hasAnyAncestor(hasTestTag("full-media-viewer"))).assertIsDisplayed()
+    }
+
+    @Test fun deletingLastPreviewClosesViewerAndUnsupportedDeletionIsDisabled() {
+        var state by mutableStateOf(connected().copy(supportsDeletion = false))
+        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, {}, {}, {}, { null },
+            onDelete = { state = state.copy(photos = emptyList()) }) } }
+        compose.onNodeWithText("DSC_0001.NEF").performClick()
+        compose.onNodeWithText("删除此文件").assertIsNotEnabled()
+        compose.runOnIdle { state = state.copy(supportsDeletion = true) }
+        compose.onNodeWithText("删除此文件").performClick()
+        compose.onNodeWithContentDescription("确认永久删除相机原文件").performClick()
+        compose.onNodeWithText("永久删除 1 个文件").performClick()
+        compose.onNodeWithTag("full-media-viewer").assertDoesNotExist()
+    }
+
+    @Test fun remoteEntryUsesAdvertisedCapabilitiesAndMtpExplainsConnectionChoices() {
+        var state by mutableStateOf(connected().copy(remoteUnavailableReason = "系统 MTP 不提供遥控，请使用 Wi-Fi"))
+        var opened = 0
+        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, {}, {}, {}, { null }, onOpenRemote = { opened++ }) } }
+        compose.onNodeWithTag("open-remote").performClick()
+        compose.onNodeWithText("系统 MTP 不提供遥控，请使用 Wi-Fi").assertIsDisplayed()
+        compose.onNodeWithText("关闭").performClick()
+        compose.runOnIdle { state = state.copy(remoteCapabilities = RemoteCapabilities(true,true,true)) }
+        compose.onNodeWithTag("open-remote").performClick()
+        assertEquals(1,opened)
+    }
+
+    @Test fun remoteDialogShowsLiveFrameAndSendsExplicitShutterAndFocusCommands() {
+        val bitmap = Bitmap.createBitmap(1280,720,Bitmap.Config.ARGB_8888)
+        var remote by mutableStateOf(com.liuzh.z8transfer.RemoteUiState(open = true,
+            status = RemoteStatus(live = true, message = "实时画面传输中"), frame = bitmap,
+            receivedAt = android.os.SystemClock.elapsedRealtime(), frameNumber = 25, fps = 6.5))
+        val actions = mutableListOf<RemoteAction>(); var closes = 0
+        compose.setContent { Z8Theme { RemoteCameraDialog(remote, RemoteCapabilities(true,true,true), { actions += it }, { closes++ }) } }
+        compose.onNodeWithContentDescription("相机实时取景").assertIsDisplayed()
+        compose.onNodeWithText("自动对焦").performClick()
+        compose.onNodeWithTag("remote-shutter").performClick()
+        assertEquals(listOf(RemoteAction.Focus,RemoteAction.Capture(true)),actions)
+        compose.onNodeWithText("暂停取景").performClick()
+        assertEquals(RemoteAction.Pause,actions.last())
+        snapshot("v050-camera-remote")
+        compose.runOnIdle { remote = remote.copy(status = remote.status.copy(busy = true)) }
+        compose.onNodeWithTag("remote-shutter").assertIsNotEnabled()
+        compose.runOnIdle { remote = remote.copy(status = remote.status.copy(busy = false,captureBlocked = true)) }
+        compose.onNodeWithTag("remote-shutter").assertIsNotEnabled()
+        compose.onNodeWithText("返回照片").performClick()
+        assertTrue(closes > 0)
+    }
+
+    @Test fun remoteViewStopsWhenActivityGoesToBackground() {
+        val closes = java.util.concurrent.atomic.AtomicInteger()
+        compose.setContent { Z8Theme { RemoteCameraDialog(com.liuzh.z8transfer.RemoteUiState(open = true),
+            RemoteCapabilities(true,true,true), {}, { closes.incrementAndGet() }) } }
+        compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.CREATED)
+        assertTrue(closes.get() > 0)
+    }
+
+    @Test fun deletingSwipedPreviewTargetsCurrentFileRatherThanInitialFile() {
+        val first = photo(1,"A.JPG",PhotoKind.JPEG); val second = photo(2,"B.JPG",PhotoKind.JPEG)
+        var removed = emptyList<CameraPhoto>()
+        compose.setContent { Z8Theme { TransferContent(connected(listOf(first,second)), {}, {}, {}, {}, {}, {}, {}, {}, {}, { null },
+            onDelete = { removed = it.files }) } }
+        compose.onNodeWithText("A.JPG").performClick()
+        compose.onNodeWithText("下一个").performClick()
+        compose.onNodeWithText("删除此文件").performClick()
+        compose.onNodeWithContentDescription("确认永久删除相机原文件").performClick()
+        compose.onNodeWithText("永久删除 1 个文件").performClick()
+        assertEquals(listOf(second),removed)
+    }
+
     private fun snapshot(name: String) {
         val directory = System.getProperty("z8.screenshotDir") ?: return
         val file = File(directory, "$name.png").apply { parentFile?.mkdirs() }

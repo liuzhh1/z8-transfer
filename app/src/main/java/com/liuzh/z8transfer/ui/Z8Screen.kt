@@ -83,7 +83,7 @@ fun Z8Screen(controller: AppController, onConnect: () -> Unit, onDownload: (Bool
     TransferContent(state, onConnect, controller::disconnect, controller::refresh, controller::toggle,
         controller::selectVisible, controller::clearSelection, onDownload, controller::requestStop,
         controller::dismissError, controller::thumbnail, controller::preview, controller::videoPreview, onDelete, onImmersiveChange,
-        controller::connectWifi, onWifiSettings, controller.lastWifiEndpoint(), controller::selectUsbMode, controller::setSelection, controller::focusRegion)
+        controller::connectWifi, onWifiSettings, controller.lastWifiEndpoint(), controller::selectUsbMode, controller::setSelection, controller::focusRegion, controller::openRemote, controller::remoteAction, controller::closeRemote)
 }
 
 @Composable
@@ -100,6 +100,7 @@ internal fun TransferContent(
     onUsbModeChange: (UsbConnectionMode) -> Unit = {},
     onSelectionChange: ((Set<String>) -> Unit)? = null,
     focusRegion: suspend (CameraPhoto) -> FocusRegion? = { null },
+    onOpenRemote: () -> Unit = {}, onRemoteAction: (RemoteAction) -> Unit = {}, onCloseRemote: () -> Unit = {},
 ) {
     var category by rememberSaveable { mutableStateOf("全部") }
     var card by rememberSaveable { mutableStateOf<Int?>(null) }
@@ -110,6 +111,7 @@ internal fun TransferContent(
     var sortName by rememberSaveable { mutableStateOf(PhotoSort.NEWEST.name) }
     var showFocus by rememberSaveable { mutableStateOf(false) }
     val sort = PhotoSort.valueOf(sortName)
+    var remoteHelp by remember { mutableStateOf(false) }
     var wifi by remember { mutableStateOf(false) }
     var info by remember { mutableStateOf(false) }
     var report by remember { mutableStateOf(false) }
@@ -140,6 +142,18 @@ internal fun TransferContent(
         card = null; day = "所有日期"
         if (!state.connected) { collapsed = false; viewing = null }
     }
+    LaunchedEffect(state.photos, state.connected, state.scanning) {
+        val old = viewing ?: return@LaunchedEffect
+        if (!state.connected || state.scanning) { viewing = null; return@LaunchedEffect }
+        val keys = state.photos.map { it.key }.toSet()
+        val remaining = old.first.filter { it.key in keys }
+        if (remaining != old.first) {
+            val currentKey = old.first.getOrNull(old.second)?.key
+            val next = remaining.indexOfFirst { it.key == currentKey }.takeIf { it >= 0 }
+                ?: old.second.coerceAtMost((remaining.size - 1).coerceAtLeast(0))
+            viewing = remaining.takeIf { it.isNotEmpty() }?.let { it to next }
+        }
+    }
     BackHandler(collapsed && viewing == null) { collapsed = false }
     val threshold = with(LocalDensity.current) { 32.dp.toPx() }
     var upward by remember { mutableFloatStateOf(0f) }
@@ -166,7 +180,11 @@ internal fun TransferContent(
             if (!collapsed) Column(Modifier.fillMaxWidth().padding(horizontal = 18.dp).testTag("browser-tools")) {
                 Row(Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("Z8 Transfer", fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                    if (state.connected) TextButton(onClick = { collapsed = true }) { Text("全屏浏览", fontSize = 12.sp) }
+                    if (state.connected) {
+                        TextButton(onClick = { if (state.remoteCapabilities.available) onOpenRemote() else remoteHelp = true },
+                            enabled = !state.busy, modifier = Modifier.testTag("open-remote")) { Text("相机遥控", fontSize = 12.sp) }
+                        TextButton(onClick = { collapsed = true }) { Text("全屏浏览", fontSize = 12.sp) }
+                    }
                     else TextButton(onClick = { wifi = true }, enabled = !state.busy) { Text("Wi-Fi 连接", fontSize = 12.sp) }
                 }
                 Surface(color = Ink, shape = RoundedCornerShape(17.dp)) {
@@ -319,6 +337,15 @@ internal fun TransferContent(
     } else null)
     if (deleteReport) BasicDialog("相机删除结果", "已删除 ${state.deletion.deleted} · 未成功 ${state.deletion.failed}\n" +
         state.deletion.outcomes.joinToString("\n") { "${it.file.name}：${if (it.deleted) "已删除" else it.error}" }) { deleteReport = false }
+    viewing?.let { (files, initial) ->
+        key(files.map { it.key }) {
+            FullMediaViewer(files, initial, state, thumbnail, preview, videoPreview, onToggle, { viewing = null },
+                showFocus, { showFocus = it }, focusRegion,
+                onDeleteFile = { file -> deletionPlan = DeletionPlan(file.sessionId, listOf(file)) },
+                onCurrentIndex = { index -> viewing?.let { current -> if (current.first == files) viewing = files to index } })
+        }
+    }
+    // Confirmation must be above the viewer dialog, including when deleting its current photo.
     deletionPlan?.let { plan ->
         DeleteConfirmation(plan, state.connected && !state.busy && state.supportsDeletion, { deletionPlan = null },
             onConfirm = { deletionPlan = null; onDelete(plan) },
@@ -326,10 +353,9 @@ internal fun TransferContent(
                 deletionPlan = null; onDelete(DeletionPlan(plan.sessionId, files))
             })
     }
-    viewing?.let { (files, initial) ->
-        FullMediaViewer(files, initial, state, thumbnail, preview, videoPreview, onToggle, { viewing = null },
-            showFocus, { showFocus = it }, focusRegion)
-    }
+    if (remoteHelp) BasicDialog("相机遥控", state.remoteUnavailableReason) { remoteHelp = false }
+    if (state.remote.open) RemoteCameraDialog(state.remote, state.remoteCapabilities, onRemoteAction, onCloseRemote)
+
 }
 
 @Composable
@@ -364,9 +390,11 @@ private fun FileTile(file: CameraPhoto, selected: Boolean, downloaded: Boolean, 
 private fun FullMediaViewer(files: List<CameraPhoto>, initial: Int, state: AppState,
     thumbnail: suspend (CameraPhoto) -> Bitmap?, preview: suspend (CameraPhoto) -> Bitmap?,
     videoPreview: suspend (CameraPhoto) -> String, onToggle: (CameraPhoto) -> Unit, onClose: () -> Unit,
-    showFocus: Boolean, onShowFocus: (Boolean) -> Unit, focusRegion: suspend (CameraPhoto) -> FocusRegion?) {
+    showFocus: Boolean, onShowFocus: (Boolean) -> Unit, focusRegion: suspend (CameraPhoto) -> FocusRegion?,
+    onDeleteFile: (CameraPhoto) -> Unit, onCurrentIndex: (Int) -> Unit) {
     val pager = rememberPagerState(initialPage = initial, pageCount = { files.size })
     val scope = rememberCoroutineScope()
+    LaunchedEffect(pager.currentPage) { onCurrentIndex(pager.currentPage) }
     var currentScale by remember { mutableFloatStateOf(1f) }
     var showInfo by remember { mutableStateOf(false) }
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
@@ -460,6 +488,10 @@ private fun FullMediaViewer(files: List<CameraPhoto>, initial: Int, state: AppSt
                 }
             }
             val file = files[pager.currentPage]
+            val deleteFailure = state.deletion.outcomes.lastOrNull { it.file.key == file.key && !it.deleted }
+            if (!state.deletion.running && deleteFailure != null) Text("删除未成功：${deleteFailure.error}",
+                color = Color(0xFFFFB8A8), fontSize = 12.sp,
+                modifier = Modifier.align(Alignment.BottomCenter).padding(start = 18.dp, end = 18.dp, bottom = 86.dp))
             Row(Modifier.align(Alignment.TopCenter).fillMaxWidth().safeDrawingPadding().background(Color.Black.copy(alpha = 0.55f)).padding(8.dp),
                 verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = onClose) { Text("返回", color = Color.White) }
@@ -482,6 +514,8 @@ private fun FullMediaViewer(files: List<CameraPhoto>, initial: Int, state: AppSt
                     colors = CheckboxDefaults.colors(uncheckedColor = Color.White), modifier = Modifier.semantics { contentDescription = "选择预览文件 ${file.name}" })
                 Text("选择此文件", color = Color.White, fontSize = 13.sp)
                 Spacer(Modifier.weight(1f))
+                TextButton(onClick = { onDeleteFile(file) }, enabled = state.connected && !state.busy && state.supportsDeletion,
+                    modifier = Modifier.testTag("delete-preview-file")) { Text("删除此文件", color = if (state.supportsDeletion) Color(0xFFFFB8A8) else Muted, fontSize = 12.sp) }
                 TextButton(onClick = { scope.launch { currentScale = 1f; pager.animateScrollToPage((pager.currentPage + 1).coerceAtMost(files.lastIndex)) } },
                     enabled = pager.currentPage < files.lastIndex) { Text("下一个", color = Color.White) }
             }

@@ -36,6 +36,7 @@ class UsbMtpTransport private constructor(
     override val diagnostics: String,
     override val supportsDeletion: Boolean,
 ) : CameraTransport {
+    override val remoteUnavailableReason: String = "系统 MTP 连接不提供遥控指令。请使用 Wi-Fi，或断开后手动选择标准 PTP（实验）连接"
     override val connectionLabel: String = "USB · 系统 MTP"
     override val sessionId: String = UUID.randomUUID().toString()
     override val usbDeviceId: Int get() = usbDevice.deviceId

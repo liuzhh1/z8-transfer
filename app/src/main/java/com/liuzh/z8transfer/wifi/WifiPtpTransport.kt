@@ -36,6 +36,12 @@ class WifiPtpTransport private constructor(
         get() = protocol.onDisconnected
         set(value) { protocol.onDisconnected = value }
 
+    override val remoteUnavailableReason: String = "当前 Wi-Fi 会话未开放遥控指令。请检查相机照片模式，退出占用相机的 App 后重新连接；也可尝试标准 USB PTP"
+    override val remoteControl: RemoteCamera? = if (displayName.contains("Nikon", ignoreCase = true))
+        NikonRemoteCamera(operations) { op, args -> withContext(Dispatchers.IO) {
+            gate.withLock { checkLive(); protocol.command(op, args) }
+        } } else null
+
     override suspend fun scan(onBatch: (List<CameraPhoto>) -> Unit, onExamined: (Int) -> Unit) = withContext(Dispatchers.IO) {
         gate.withLock {
             checkLive()
@@ -154,6 +160,7 @@ class WifiPtpTransport private constructor(
     }
     override fun markDetached() { live.set(false); protocol.close(); route.close() }
     override suspend fun close() = withContext(Dispatchers.IO) {
+        if (attached) runCatching { remoteControl?.close() }
         live.set(false)
         protocol.onDisconnected = null
         route.onLost = null

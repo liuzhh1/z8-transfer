@@ -33,6 +33,12 @@ class UsbPtpTransport private constructor(
     override val attached: Boolean get() = live.get() && protocol.usable
     override val supportsDeletion: Boolean get() = 0x100b in operations
 
+    override val remoteUnavailableReason: String = "相机未在此标准 PTP 会话声明遥控指令，请检查相机模式，或尝试 Wi-Fi 连接"
+    override val remoteControl: RemoteCamera? = if (displayName.contains("Nikon", ignoreCase = true))
+        NikonRemoteCamera(operations) { op, args -> withContext(Dispatchers.IO) {
+            gate.withLock { checkLive(); protocol.command(op, args) }
+        } } else null
+
     override suspend fun scan(onBatch: (List<CameraPhoto>) -> Unit, onExamined: (Int) -> Unit) = withContext(Dispatchers.IO) {
         gate.withLock {
             checkLive()
@@ -147,6 +153,7 @@ class UsbPtpTransport private constructor(
     }
     override fun markDetached() { live.set(false) }
     override suspend fun close() = withContext(Dispatchers.IO) {
+        if (attached) runCatching { remoteControl?.close() }
         live.set(false)
         gate.withLock {
             if (protocol.usable) runCatching { protocol.command(0x1003).requireOk() }

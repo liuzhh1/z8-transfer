@@ -13,6 +13,8 @@ interface CameraTransport {
     val diagnostics: String
     val attached: Boolean
     val usbDeviceId: Int? get() = null
+    val remoteControl: RemoteCamera? get() = null
+    val remoteUnavailableReason: String get() = "当前连接未开放遥控拍照和实时取景"
     val supportsDeletion: Boolean get() = false
     val connectionLabel: String get() = "USB"
     val deletionUnavailableReason: String get() = "当前相机连接未声明支持删除"
