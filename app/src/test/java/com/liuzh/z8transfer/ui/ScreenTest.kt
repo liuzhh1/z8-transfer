@@ -202,6 +202,92 @@ class ScreenTest {
         compose.onNodeWithText("● USB · 系统 MTP 已连接 · 照片与视频").assertIsDisplayed()
     }
 
+    @Test fun rawAndJpegFiltersAndSortingAreIndependentOfSelection() {
+        val raw = photo(1, "B.NEF")
+        val jpeg = photo(2, "A.JPG", PhotoKind.JPEG)
+        var state by mutableStateOf(connected(listOf(raw, jpeg)).copy(selected = setOf(raw.key)))
+        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, {}, {}, {}, { null }) } }
+        compose.onAllNodesWithText("JPEG")[0].performClick()
+        compose.onNodeWithText("A.JPG").assertIsDisplayed()
+        compose.onNodeWithText("B.NEF").assertDoesNotExist()
+        compose.onNodeWithText("已选 1 个文件").assertIsDisplayed()
+        compose.onAllNodesWithText("RAW")[0].performClick()
+        compose.onNodeWithText("B.NEF").assertIsDisplayed()
+        compose.onNodeWithText("排序 ▾").performClick()
+        compose.onNodeWithText("文件名：升序").performClick()
+        compose.onNodeWithText("B.NEF").assertExists()
+    }
+
+    @Test fun sixColumnLayoutAndFastScrollCanReachEndOfLargeList() {
+        val files = (1..180).map { photo(it, "DSC_%04d.NEF".format(it)) }
+        compose.setContent { Z8Theme { TransferContent(connected(files), {}, {}, {}, {}, {}, {}, {}, {}, {}, { null }) } }
+        compose.onNodeWithText("2列 ▾").performClick()
+        compose.onNodeWithText("6列").performClick()
+        compose.onNodeWithText("6列 ▾").assertIsDisplayed()
+        snapshot("v040-six-columns")
+        compose.onNodeWithTag("page-handle").assertIsDisplayed().performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.SetProgress) { it(1f) }
+        compose.onNodeWithText("DSC_0180.NEF").assertExists()
+    }
+
+    @Test fun longPressDragSelectsRangeAndCanDeselectIt() {
+        val files = (1..6).map { photo(it, "DSC_%04d.NEF".format(it)) }
+        var state by mutableStateOf(connected(files))
+        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, {}, {}, {}, { null },
+            onSelectionChange = { state = state.copy(selected = it) }) } }
+        compose.onNodeWithText("全屏浏览").performClick()
+        fun drag() {
+            compose.onNodeWithTag("file-grid").performTouchInput {
+                down(androidx.compose.ui.geometry.Offset(width * .25f, 100f))
+            }
+            compose.mainClock.advanceTimeBy(750)
+            compose.onNodeWithTag("file-grid").performTouchInput {
+                moveTo(androidx.compose.ui.geometry.Offset(width * .7f, 120f), 100)
+                up()
+            }
+        }
+        drag()
+        compose.runOnIdle { assertEquals(setOf(files[0].key, files[1].key), state.selected) }
+        drag()
+        compose.runOnIdle { assertTrue(state.selected.isEmpty()) }
+        compose.onNodeWithTag("full-media-viewer").assertDoesNotExist()
+    }
+
+    @Test fun focusToggleShowsRealOverlayAndRemovesItWhenHidden() {
+        val bitmap = Bitmap.createBitmap(800, 600, Bitmap.Config.ARGB_8888)
+        compose.setContent { Z8Theme { TransferContent(connected(), {}, {}, {}, {}, {}, {}, {}, {}, {}, { bitmap },
+            focusRegion = { FocusRegion(.2f, .3f, .4f, .5f, true) }) } }
+        compose.onNodeWithText("DSC_0001.NEF").performClick()
+        compose.onNodeWithText("显示对焦框").performClick()
+        compose.onNodeWithTag("focus-overlay").assertExists()
+        snapshot("v040-focus-overlay")
+        compose.onNodeWithText("隐藏对焦框").performClick()
+        compose.onNodeWithTag("focus-overlay").assertDoesNotExist()
+    }
+
+    @Test fun optionalCompanionJpegAppearsInConfirmedListAndChangingItResetsAcknowledgement() {
+        val raw = photo(); val jpeg = photo(2, "DSC_0001.JPG", PhotoKind.JPEG)
+        var confirmed = emptyList<CameraPhoto>()
+        compose.setContent { Z8Theme { DeleteConfirmation(DeletionPlan(raw.sessionId, listOf(raw)), true, {}, onConfirm = {},
+            companions = listOf(jpeg), onConfirmFiles = { confirmed = it }) } }
+        compose.onNodeWithText("DSC_0001.JPG").assertDoesNotExist()
+        compose.onNodeWithContentDescription("确认永久删除相机原文件").performClick()
+        compose.onNodeWithContentDescription("同时删除同名 JPEG").performClick()
+        compose.onNodeWithText("DSC_0001.JPG").assertIsDisplayed()
+        compose.onNodeWithText("永久删除 2 个文件").assertIsNotEnabled()
+        compose.onNodeWithContentDescription("确认永久删除相机原文件").performClick()
+        snapshot("v040-paired-delete")
+        compose.onNodeWithText("永久删除 2 个文件").performClick()
+        assertEquals(listOf(raw, jpeg), confirmed)
+    }
+
+    @Test fun wirelessDeletionIsEnabledWhenCameraAdvertisesIt() {
+        val p = photo()
+        compose.setContent { Z8Theme { TransferContent(connected().copy(connectionLabel = "Wi-Fi", selected = setOf(p.key)),
+            {}, {}, {}, {}, {}, {}, {}, {}, {}, { null }) } }
+        compose.onNodeWithText("删除相机文件").assertIsEnabled().performClick()
+        compose.onNodeWithText("永久删除 1 个文件").assertIsNotEnabled()
+    }
+
     private fun snapshot(name: String) {
         val directory = System.getProperty("z8.screenshotDir") ?: return
         val file = File(directory, "$name.png").apply { parentFile?.mkdirs() }

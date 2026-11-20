@@ -1,3 +1,65 @@
+# Z8 Transfer v0.4.0：照片浏览与删除改造
+
+日期：2026-11-20。基于仓库 main 的 `f7a7465a378944d59ed7d61bda06696f8e77b35b`。
+
+## 本次实现
+
+| 需求 | 行为 |
+|---|---|
+| 排序按钮 | 时间、名称、大小各支持升降序，保留原有选择 |
+| 长按滑动批量选择 | 连续范围选择/取消、反向缩回恢复原始选择、边缘自动滚动 |
+| RAW / JPEG 筛选 | 独立格式入口，与存储卡、日期、文件名筛选叠加 |
+| Wi-Fi 删除 | 按 DeleteObject 能力开放；逐文件复核会话、存储卡卷、元数据、保护状态；无通配、无自动重试 |
+| 对焦框开关 | 读取 Nikon AFInfo2 0400 明确坐标，按 EXIF 方向变换并随图片缩放/平移；无坐标时显示提示 |
+| 六列 | 1–6 列菜单，4–6 列紧凑展示 |
+| 翻页手柄 | 网格右侧拖动定位，提供无障碍进度操作和拖动序号 |
+| RAW 配套 JPEG 删除 | 确认框可选，限定同卡卷/同目录/同主文件名，大小写和 .jpg/.jpeg 兼容；改变选项后重新确认 |
+
+NEF 优先使用配套 JPEG；没有配套时尝试读取内嵌 JPEG。此功能读取内嵌预览，未实现 RAW 像素解码。JPEG/HEIF 原图缓存上限 64 MiB，NEF 192 MiB，内嵌 JPEG 32 MiB。对焦坐标与预览使用相同来源和方向。
+
+## 自动化验证
+
+JDK 21.0.13.1 / Gradle 8.13 / AGP 8.13.2 / Kotlin 2.2.10 / compileSdk、targetSdk 36 / minSdk 29。
+
+```bash
+./gradlew --max-workers=2 :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
+```
+
+完整检查通过：**103 项测试全部通过，Lint 0 错误、0 警告，Debug APK 构建成功**。apksigner 验签与 zipalign 16 KiB 对齐检查通过。
+
+| 测试集 | 用例数 | 结果 |
+|---|---:|---|
+| DeletionEngineTest | 7 | 全通过 |
+| NikonFocusMetadataTest | 4 | 全通过 |
+| PhotoBrowserTest | 3 | 全通过 |
+| PtpIpProtocolTest | 14 | 全通过 |
+| PtpProtocolTest | 11 | 全通过 |
+| TransferEngineTest | 17 | 全通过 |
+| UsbSessionInitializerTest | 19 | 全通过 |
+| ScreenTest | 21 | 全通过 |
+| WifiDeletionTest | 3 | 全通过 |
+| WifiRouteTest | 4 | 全通过 |
+
+## 安装包校验
+
+- 文件：`Z8Transfer-v0.4.0.apk`
+- 大小：28,614,364 字节
+- SHA-256：`fc398a7ce59d656bf05b73c7556e836851a8e380817522de1803a98637d1b51c`
+- 签名证书 SHA-256：`513855ef2625e9748888bf597768d9e056b297b80ec592e09d950203c45e398e`，与仓库原 0.3.2 记录一致，可覆盖更新。
+
+测试使用本地合成 EXIF/TIFF、PTP/IP 字节流、Robolectric API 35（393×852 dp）和 Compose 触控注入。
+Wi-Fi 删除验证实际经过 WifiPtpTransport 和 PtpIpProtocol，检查 DeleteObject 的句柄和参数；拒绝、不支持、受保护、卡卷变化、元数据变化、旧会话均有覆盖。
+
+## 实机验证边界
+
+本次没有连接真实 Z8 或手机，没有实际删除相机文件。需在用户设备验证 Wi-Fi 固件是否开放删除及保护状态反馈、长按拖选与边缘滚动、1–6 列布局、手柄定位，以及不同方向的 NEF/JPEG 对焦框位置。
+
+对焦框只支持 AFInfo2 0400 的明确矩形坐标；没有坐标的 AF 点掩码、其他布局、HEIF、视频或无法解码的内嵌预览不承诺显示。无线删除被相机拒绝时显示错误，用户可在相机中删除。RAW 和 JPEG 独立逐项执行，部分失败会分别报告。
+
+公开测试签名与 0.3.2 相同，包名继续使用 `com.liuzh.z8transfer.wifi`，versionName 0.4.0 / versionCode 6。
+
+---
+
 # Z8 Transfer v0.3.2：系统 MTP 默认连接验证记录
 
 日期：2026-11-09。

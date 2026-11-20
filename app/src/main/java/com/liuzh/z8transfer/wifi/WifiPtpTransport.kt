@@ -30,9 +30,8 @@ class WifiPtpTransport private constructor(
     private val live = AtomicBoolean(true)
     private val gate = Mutex()
     override val attached: Boolean get() = live.get() && protocol.usable && route.available
-    // This first wireless build deliberately exposes no destructive Wi-Fi operation.
-    // USB retains its checked DeleteObject implementation.
-    override val deletionUnavailableReason: String = "Wi-Fi 测试版支持浏览与下载；删除相机文件请使用 USB 连接"
+    override val supportsDeletion: Boolean get() = 0x100b in operations
+    override val deletionUnavailableReason: String = "相机当前 Wi-Fi 模式未开放删除，请切换连接方式或在相机中删除"
     var onDisconnected: (() -> Unit)?
         get() = protocol.onDisconnected
         set(value) { protocol.onDisconnected = value }
@@ -127,6 +126,27 @@ class WifiPtpTransport private constructor(
         }
     }
 
+    override suspend fun deleteOriginal(photo: CameraPhoto) = withContext(Dispatchers.IO) {
+        gate.withLock {
+            checkPhoto(photo)
+            check(supportsDeletion) { deletionUnavailableReason }
+            val card = PtpData(protocol.command(0x1005, intArrayOf(photo.storageId)).requireOk().data)
+            card.u16(); card.u16(); card.u16()
+            val capacity = card.u64(); card.u64(); card.u32(); card.string()
+            val volume = card.string().ifBlank { "session:$sessionId" }
+            check(photo.storageIdentity == "$volume:$capacity") { "存储卡已变化，未执行删除；请刷新列表" }
+            val info = objectInfo(photo.handle)
+            check(info.matches(photo)) { "文件已变化或句柄已复用，未执行删除；请刷新列表" }
+            check(info.protection == 0) { "文件受到相机保护，请先在相机中解除保护" }
+            if (photo.size > 0 && info.rawSize == 0xffffffffL) {
+                check(objectSize(photo.handle, info.rawSize) == photo.size) { "文件大小已变化，未执行删除" }
+            }
+            checkLive()
+            protocol.command(0x100b, intArrayOf(photo.handle, 0)).requireOk()
+            Unit
+        }
+    }
+
     private fun checkLive() { check(attached) { "相机 Wi-Fi 已断开，请重新连接" } }
     private fun checkPhoto(photo: CameraPhoto) {
         checkLive()
@@ -171,7 +191,7 @@ class WifiPtpTransport private constructor(
                 val name = "$manufacturer $model".trim().ifBlank { opened.cameraName.ifBlank { "Nikon Z8" } }
                 val cameraGuid = opened.cameraGuid.joinToString("") { "%02x".format(it.toInt() and 0xff) }
                 val identity = stableHash("$manufacturer:$model:${serial.ifBlank { "ptpip:$cameraGuid" }}")
-                val diagnostic = "设备：$name\n设备版本：$version\n连接：Wi-Fi PTP/IP · 64 位流式传输\n地址：${route.endpoint.host}:${route.endpoint.port}\n路由：独立绑定 Wi-Fi，不经过蜂窝数据\n无线删除：测试版暂未开放\n手机：${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE}"
+                val diagnostic = "设备：$name\n设备版本：$version\n连接：Wi-Fi PTP/IP · 64 位流式传输\n地址：${route.endpoint.host}:${route.endpoint.port}\n路由：独立绑定 Wi-Fi，不经过蜂窝数据\n无线删除：${if (0x100b in operations) "相机已声明支持" else "相机未开放"}\n手机：${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE}"
                 check(opened.usable && route.available) { "相机 Wi-Fi 已断开" }
                 prefs.edit { putString("last-host", endpoint.host); putInt("last-port", endpoint.port) }
                 WifiPtpTransport(route, opened, name, identity, operations, diagnostic)

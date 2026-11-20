@@ -3,6 +3,9 @@ package com.liuzh.z8transfer
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import com.liuzh.z8transfer.core.NikonFocusMetadata
+import com.liuzh.z8transfer.core.FocusRegion
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.util.LruCache
@@ -30,6 +33,7 @@ import com.liuzh.z8transfer.wifi.WifiPtpTransport
 import com.liuzh.z8transfer.core.WifiEndpoint
 import android.os.ParcelFileDescriptor
 import java.io.File
+import java.io.RandomAccessFile
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -219,6 +223,14 @@ class AppController(context: Context) {
         mutableState.update { it.copy(selected = if (photo.key in it.selected) it.selected - photo.key else it.selected + photo.key) }
     }
 
+    fun setSelection(keys: Set<String>) {
+        if (state.value.busy) return
+        mutableState.update { current ->
+            val valid = current.photos.map { it.key }.toSet()
+            current.copy(selected = keys.intersect(valid))
+        }
+    }
+
     fun selectVisible(photos: List<CameraPhoto>) {
         if (state.value.busy) return
         val keys = photos.map { it.key }.toSet()
@@ -312,23 +324,59 @@ class AppController(context: Context) {
         onConnectionLost(source, "${source.connectionLabel} 会话已中断，请重新连接。已完成的下载已保留")
     }
 
-    suspend fun preview(photo: CameraPhoto): Bitmap? {
-        val target = if (photo.kind == PhotoKind.RAW) state.value.photos.firstOrNull {
+    private fun previewTarget(photo: CameraPhoto): CameraPhoto =
+        if (photo.kind == PhotoKind.RAW) state.value.photos.firstOrNull {
             it.sessionId == photo.sessionId && it.storageId == photo.storageId && it.folder == photo.folder && it.kind == PhotoKind.JPEG &&
                 it.name.substringBeforeLast('.').equals(photo.name.substringBeforeLast('.'), true)
         } ?: photo else photo
-        if (target.kind != PhotoKind.JPEG && target.kind != PhotoKind.HEIF) return thumbnail(photo)
-        if (target.size !in 1..64L * 1024 * 1024 || state.value.busy) return thumbnail(photo)
+
+    suspend fun preview(photo: CameraPhoto): Bitmap? {
+        val target = previewTarget(photo)
+        if (!target.kind.isPhoto) return thumbnail(photo)
+        val limit = if (target.kind == PhotoKind.RAW) 192L * 1024 * 1024 else 64L * 1024 * 1024
+        if (target.size !in 1..limit || state.value.busy) return thumbnail(photo)
         return withContext(Dispatchers.IO) {
             runCatching {
                 val file = cacheOriginal(target)
+                val metadata = NikonFocusMetadata.read(file)
+                val embedded = if (target.kind == PhotoKind.RAW) metadata.preview?.let { region ->
+                    RandomAccessFile(file, "r").use { input ->
+                        input.seek(region.offset); ByteArray(region.length).also(input::readFully)
+                    }
+                } ?: return@runCatching null else null
+                fun decode(options: BitmapFactory.Options) = if (embedded != null)
+                    BitmapFactory.decodeByteArray(embedded, 0, embedded.size, options) else BitmapFactory.decodeFile(file.absolutePath, options)
                 val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                BitmapFactory.decodeFile(file.absolutePath, bounds)
+                decode(bounds)
                 var scale = 1
                 while (maxOf(bounds.outWidth, bounds.outHeight) / scale > 2560) scale *= 2
-                BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply { inSampleSize = scale })
+                val bitmap = decode(BitmapFactory.Options().apply { inSampleSize = scale })
+                val orientation = metadata.orientation
+                if (bitmap == null || orientation == 1) bitmap else {
+                    val matrix = Matrix().apply {
+                        when (orientation) {
+                            2 -> setScale(-1f, 1f)
+                            3 -> setRotate(180f)
+                            4 -> setScale(1f, -1f)
+                            5 -> { setRotate(90f); postScale(-1f, 1f) }
+                            6 -> setRotate(90f)
+                            7 -> { setRotate(90f); postScale(1f, -1f) }
+                            8 -> setRotate(270f)
+                        }
+                    }
+                    Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+                }
             }.getOrNull()
         } ?: thumbnail(photo)
+    }
+
+    suspend fun focusRegion(photo: CameraPhoto): FocusRegion? = withContext(Dispatchers.IO) {
+        val target = previewTarget(photo)
+        // The overlay and bitmap must use the same original and orientation.
+        val limit = if (target.kind == PhotoKind.RAW) 192L * 1024 * 1024 else 64L * 1024 * 1024
+        if ((target.kind != PhotoKind.JPEG && target.kind != PhotoKind.RAW) || target.size !in 1..limit || state.value.busy) return@withContext null
+        val metadata = NikonFocusMetadata.read(cacheOriginal(target))
+        if (target.kind == PhotoKind.RAW && metadata.preview == null) null else metadata.focus
     }
 
     suspend fun videoPreview(photo: CameraPhoto): String = withContext(Dispatchers.IO) {
