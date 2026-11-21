@@ -55,6 +55,7 @@ class UsbPtpTransport private constructor(
                 val seen = mutableSetOf<Int>()
                 directories.add(-1 to "")
                 while (directories.isNotEmpty()) {
+                    currentCoroutineContext().ensureActive(); checkLive()
                     val (parent, folder) = directories.removeFirst()
                     val handles = PtpData(protocol.command(0x1007, intArrayOf(id, 0, parent)).requireOk().data).array32()
                     for (handle in handles) {

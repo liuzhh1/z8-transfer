@@ -10,6 +10,7 @@ import com.liuzh.z8transfer.core.RemoteCapabilities
 import com.liuzh.z8transfer.core.RemoteStatus
 import com.liuzh.z8transfer.core.RemoteAction
 import com.liuzh.z8transfer.core.RemoteSession
+import com.liuzh.z8transfer.core.CameraPage
 import android.os.SystemClock
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
@@ -58,6 +59,9 @@ data class AppState(
     val cameraName: String? = null,
     val diagnostics: String = "",
     val connecting: Boolean = false,
+    val page: CameraPage = CameraPage.HOME,
+    val switchingPage: Boolean = false,
+    val photosCurrent: Boolean = false,
     val scanning: Boolean = false,
     val examined: Int = 0,
     val photos: List<CameraPhoto> = emptyList(),
@@ -75,7 +79,7 @@ data class AppState(
     val usbMode: UsbConnectionMode = UsbConnectionMode.SYSTEM_MTP,
 ) {
     val connected: Boolean get() = cameraName != null
-    val busy: Boolean get() = connecting || scanning || progress.running || deletion.running || remote.open
+    val busy: Boolean get() = connecting || switchingPage || scanning || progress.running || deletion.running || remote.open
 }
 
 class AppController(context: Context) {
@@ -92,9 +96,11 @@ class AppController(context: Context) {
     private var remoteJob: Job? = null
     @Volatile private var remoteSession: RemoteSession? = null
     private val remoteCaptured = AtomicBoolean(false)
+    @Volatile private var foreground = true
     private var queued: List<CameraPhoto> = emptyList()
     private var queuedDeletion: DeletionPlan? = null
     private var cleanupJob: Job? = null
+    private val remoteCloseGate = Mutex()
     private val previewGate = Mutex()
     @Volatile private var scanGeneration = 0
     private val stop = AtomicBoolean(false)
@@ -161,9 +167,9 @@ class AppController(context: Context) {
                 mutableState.update { it.copy(cameraName = opened.displayName, diagnostics = opened.diagnostics, connecting = false,
                     supportsDeletion = opened.supportsDeletion, connectionLabel = opened.connectionLabel,
                     remoteCapabilities = opened.remoteControl?.capabilities ?: RemoteCapabilities(),
-                    remoteUnavailableReason = opened.remoteUnavailableReason, remote = RemoteUiState(),
+                    remoteUnavailableReason = opened.remoteUnavailableReason, remote = RemoteUiState(), photosCurrent = false,
                     deletionUnavailableReason = opened.deletionUnavailableReason, error = null) }
-                refresh()
+                if (!state.value.switchingPage) startRequestedPage()
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
@@ -173,37 +179,77 @@ class AppController(context: Context) {
         }
     }
 
-    fun refresh() = scanCamera(false)
+    fun selectPage(page: CameraPage) {
+        val current = state.value
+        if (current.progress.running || current.deletion.running || current.switchingPage) return
+        if (page == current.page && when (page) {
+            CameraPage.HOME -> true
+            CameraPage.REMOTE -> current.remote.open || current.connecting
+            CameraPage.PHOTOS -> current.scanning || current.photosCurrent || current.connecting
+        }) return
+        // Hide the gallery immediately. Its current transaction may finish, but no remaining files are enumerated.
+        mutableState.update { it.copy(page = page, switchingPage = true,
+            photosCurrent = if (page == CameraPage.PHOTOS) false else it.photosCurrent, error = null) }
+        scope.launch {
+            try {
+                cancelPhotoScan()
+                finishRemoteSession()
+            } finally {
+                mutableState.update { it.copy(switchingPage = false) }
+            }
+            if (!state.value.connecting && state.value.connected) startRequestedPage()
+        }
+    }
+
+    private fun startRequestedPage() {
+        when (state.value.page) {
+            CameraPage.HOME -> Unit
+            CameraPage.REMOTE -> beginRemote()
+            CameraPage.PHOTOS -> if (!state.value.photosCurrent) scanCamera(true)
+        }
+    }
+
+    private suspend fun cancelPhotoScan() {
+        val previous = scanJob
+        scanGeneration++
+        scanJob = null
+        previous?.cancelAndJoin()
+        mutableState.update { it.copy(scanning = false) }
+    }
+
+    fun refresh() { if (state.value.page == CameraPage.PHOTOS) scanCamera(false) }
 
     private fun scanCamera(preserveSelection: Boolean) {
         val source = transport ?: return
-        if (state.value.busy || !source.attached) return
+        if (state.value.page != CameraPage.PHOTOS || state.value.busy || !source.attached) return
         scanJob?.cancel()
-        scanGeneration++
+        val generation = ++scanGeneration
+        fun currentScan() = generation == scanGeneration && source === transport &&
+            state.value.page == CameraPage.PHOTOS && !state.value.switchingPage
         thumbnailCache.evictAll()
-        mutableState.update { it.copy(scanning = true, examined = 0, photos = emptyList(), selected = if (preserveSelection) it.selected else emptySet(),
+        mutableState.update { it.copy(scanning = true, photosCurrent = false, examined = 0, photos = emptyList(),
+            selected = if (preserveSelection) it.selected else emptySet(),
             downloaded = if (preserveSelection) it.downloaded else emptySet(), error = null) }
         scanJob = scope.launch {
             try {
                 source.scan(onBatch = { batch ->
-                    mutableState.update { old ->
-                        old.copy(photos = (old.photos + batch).sortedWith(compareByDescending<CameraPhoto> { it.sortTime }.thenBy { it.name }))
+                    if (currentScan()) mutableState.update { old ->
+                        if (!currentScan()) old else old.copy(photos = (old.photos + batch).sortedWith(compareByDescending<CameraPhoto> { it.sortTime }.thenBy { it.name }))
                     }
-                }, onExamined = { count -> mutableState.update { it.copy(examined = count) } })
+                }, onExamined = { count -> if (currentScan()) mutableState.update { it.copy(examined = count) } })
+                if (!currentScan()) return@launch
                 mutableState.update { current ->
                     val keys = current.photos.map { it.key }.toSet()
-                    current.copy(scanning = false, selected = current.selected.intersect(keys), downloaded = current.downloaded.intersect(keys))
+                    current.copy(scanning = false, photosCurrent = true, selected = current.selected.intersect(keys), downloaded = current.downloaded.intersect(keys))
                 }
-                // Check the local copy before displaying a downloaded badge.
                 for (photo in state.value.photos) {
                     ensureActive()
-                    if (source !== transport || !source.attached) break
-                    if (store.existing(photo) != null) mutableState.update { it.copy(downloaded = it.downloaded + photo.key) }
+                    if (!currentScan() || !source.attached) break
+                    if (store.existing(photo) != null && currentScan()) mutableState.update { it.copy(downloaded = it.downloaded + photo.key) }
                 }
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                mutableState.update { it.copy(scanning = false, error = error.message ?: "读取照片列表失败") }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) {
+                if (currentScan()) mutableState.update { it.copy(scanning = false, error = error.message ?: "读取照片列表失败") }
                 if (!source.attached) invalidateConnection(source)
             }
         }
@@ -215,9 +261,9 @@ class AppController(context: Context) {
         val previous = transport
         previous?.markDetached()
         transport = null
-        scanJob?.cancel()
+        scanGeneration++; scanJob?.cancel()
         thumbnailCache.evictAll()
-        mutableState.update { it.copy(cameraName = null, scanning = false, photos = emptyList(), selected = emptySet(), downloaded = emptySet()) }
+        mutableState.update { it.copy(cameraName = null, photosCurrent = false, scanning = false, photos = emptyList(), selected = emptySet(), downloaded = emptySet()) }
         cleanupJob = scope.launch { previous?.close() }
     }
 
@@ -232,18 +278,25 @@ class AppController(context: Context) {
         previous.markDetached()
         stop.set(true)
         transport = null
-        scanJob?.cancel()
+        scanGeneration++; scanJob?.cancel()
         remoteJob?.cancel(); remoteSession = null
-        mutableState.update { it.copy(cameraName = null, remote = RemoteUiState(), remoteCapabilities = RemoteCapabilities(), scanning = false, photos = emptyList(), selected = emptySet(), downloaded = emptySet(),
+        mutableState.update { it.copy(cameraName = null, photosCurrent = false, remote = RemoteUiState(), remoteCapabilities = RemoteCapabilities(), scanning = false, photos = emptyList(), selected = emptySet(), downloaded = emptySet(),
             supportsDeletion = false, error = message) }
         cleanupJob = scope.launch { previous.close() }
     }
 
-    fun openRemote() {
+    fun setForeground(visible: Boolean) {
+        foreground = visible
+        if (!visible) closeRemote()
+    }
+
+    fun openRemote() = selectPage(CameraPage.REMOTE)
+
+    private fun beginRemote() {
         val source = transport ?: return
         val camera = source.remoteControl
-        if (state.value.busy || !source.attached) return
-        if (camera == null || !camera.capabilities.available) { showError(source.remoteUnavailableReason); return }
+        if (!foreground || state.value.page != CameraPage.REMOTE || state.value.busy || !source.attached) return
+        if (camera == null || !camera.capabilities.available) return
         remoteCaptured.set(false)
         val session = RemoteSession(camera)
         remoteSession = session
@@ -277,7 +330,7 @@ class AppController(context: Context) {
                             fps = if (elapsed >= 1000) windowFrames * 1000.0 / elapsed else current.remote.fps)) }
                     }
                     if (elapsed >= 1000) { windowFrames = 0; windowStart = now }
-                }, onAccepted = { remoteCaptured.set(true) }, onCleanupFailure = { error ->
+                }, onAccepted = { if (source === transport) remoteCaptured.set(true) }, onCleanupFailure = { error ->
                     if (source === transport) onConnectionLost(source, "结束相机遥控未确认，请重新连接并检查相机状态：${error.message}")
                 })
             } catch (cancelled: CancellationException) { throw cancelled }
@@ -300,16 +353,21 @@ class AppController(context: Context) {
 
     fun closeRemote() {
         if (!state.value.remote.open || state.value.remote.closing) return
+        mutableState.update { it.copy(remote = it.remote.copy(closing = true)) }
+        scope.launch { finishRemoteSession() }
+    }
+
+    private suspend fun finishRemoteSession() = remoteCloseGate.withLock {
+        if (!state.value.remote.open) return@withLock
         val source = transport
         val job = remoteJob
         mutableState.update { it.copy(remote = it.remote.copy(closing = true)) }
-        scope.launch {
-            job?.cancelAndJoin()
-            if (source === transport) {
-                remoteJob = null; remoteSession = null
-                mutableState.update { it.copy(remote = RemoteUiState()) }
-                if (remoteCaptured.getAndSet(false) && source?.attached == true) scanCamera(true)
-            }
+        job?.cancelAndJoin()
+        if (source === transport) {
+            remoteJob = null; remoteSession = null
+            val dirty = remoteCaptured.getAndSet(false)
+            // The next explicit visit to Downloads reloads new photographs. Closing the camera never starts a scan.
+            mutableState.update { it.copy(remote = RemoteUiState(), photosCurrent = it.photosCurrent && !dirty) }
         }
     }
 

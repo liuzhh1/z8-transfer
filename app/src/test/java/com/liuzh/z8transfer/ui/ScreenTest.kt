@@ -31,7 +31,7 @@ class ScreenTest {
         "DCIM/100NZ_8", name, if (kind == PhotoKind.NEV) 6L * 1024 * 1024 * 1024 else 12_582_912L,
         1_793_930_400_000L, 1_793_930_400_000L, kind,
     )
-    private fun connected(files: List<CameraPhoto> = listOf(photo())) = AppState(storageReady = true, cameraName = "Nikon Z8", photos = files, supportsDeletion = true)
+    private fun connected(files: List<CameraPhoto> = listOf(photo())) = AppState(storageReady = true, cameraName = "Nikon Z8", page = CameraPage.PHOTOS, photosCurrent = true, photos = files, supportsDeletion = true)
 
     @Test fun disconnectedScreenGuidesConnectionWithoutDestructiveActions() {
         var connections = 0
@@ -321,15 +321,17 @@ class ScreenTest {
         compose.onNodeWithTag("full-media-viewer").assertDoesNotExist()
     }
 
-    @Test fun remoteEntryUsesAdvertisedCapabilitiesAndMtpExplainsConnectionChoices() {
+    @Test fun remoteEntryUsesIndependentPageAndMtpExplainsConnectionChoices() {
         var state by mutableStateOf(connected().copy(remoteUnavailableReason = "系统 MTP 不提供遥控，请使用 Wi-Fi"))
         var opened = 0
-        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, {}, {}, {}, { null }, onOpenRemote = { opened++ }) } }
+        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, {}, {}, {}, { null },
+            onOpenRemote = { opened++ }, onPageChange = { state = state.copy(page = it) }) } }
         compose.onNodeWithTag("open-remote").performClick()
+        compose.onNodeWithTag("file-grid").assertDoesNotExist()
         compose.onNodeWithText("系统 MTP 不提供遥控，请使用 Wi-Fi").assertIsDisplayed()
-        compose.onNodeWithText("关闭").performClick()
+        compose.onNodeWithTag("start-remote").assertIsNotEnabled()
         compose.runOnIdle { state = state.copy(remoteCapabilities = RemoteCapabilities(true,true,true)) }
-        compose.onNodeWithTag("open-remote").performClick()
+        compose.onNodeWithTag("start-remote").performClick()
         assertEquals(1,opened)
     }
 
@@ -374,6 +376,42 @@ class ScreenTest {
         compose.onNodeWithContentDescription("确认永久删除相机原文件").performClick()
         compose.onNodeWithText("永久删除 1 个文件").performClick()
         assertEquals(listOf(second),removed)
+    }
+
+    @Test fun scanningGalleryStillAllowsSwitchingToRemotePage() {
+        var state by mutableStateOf(connected().copy(scanning = true, photosCurrent = false))
+        var target: CameraPage? = null
+        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, {}, {}, {}, { null },
+            onPageChange = { target = it; state = state.copy(page = it, scanning = false) }) } }
+        compose.onNodeWithTag("open-remote").assertIsEnabled().performClick()
+        assertEquals(CameraPage.REMOTE,target)
+        compose.onNodeWithTag("file-grid").assertDoesNotExist()
+        compose.onNodeWithText("搜索文件名").assertDoesNotExist()
+    }
+
+    @Test fun connectedHomeHasNoGalleryAndDownloadsRequiresExplicitPageSelection() {
+        var state by mutableStateOf(connected().copy(page = CameraPage.HOME))
+        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, {}, {}, {}, { null },
+            onPageChange = { state = state.copy(page = it) }) } }
+        compose.onNodeWithTag("file-grid").assertDoesNotExist()
+        compose.onNodeWithText("相机已连接，选择功能").assertIsDisplayed()
+        snapshot("v060-home")
+        compose.onNodeWithTag("open-photos").performClick()
+        compose.onNodeWithTag("file-grid").assertExists()
+    }
+
+    @Test fun remoteIsAFullPageWithDirectDownloadsNavigation() {
+        val state = connected().copy(page = CameraPage.REMOTE, remoteCapabilities = RemoteCapabilities(true,true,true),
+            remote = com.liuzh.z8transfer.RemoteUiState(open = true))
+        var target: CameraPage? = null
+        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, {}, {}, {}, { null },
+            onPageChange = { target = it }) } }
+        compose.onNodeWithTag("remote-camera").assertIsDisplayed()
+        compose.onNodeWithTag("file-grid").assertDoesNotExist()
+        compose.onNodeWithTag("browser-tools").assertDoesNotExist()
+        snapshot("v060-remote-page")
+        compose.onNodeWithText("下载照片").performClick()
+        assertEquals(CameraPage.PHOTOS,target)
     }
 
     private fun snapshot(name: String) {
