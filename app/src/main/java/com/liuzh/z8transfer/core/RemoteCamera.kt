@@ -14,13 +14,16 @@ data class RemoteCapabilities(val liveView: Boolean = false, val capture: Boolea
 data class CaptureReceipt(val ready: Boolean, val message: String)
 interface RemoteCamera {
     val capabilities: RemoteCapabilities
+    val parameterCoverage: String? get() = null
     suspend fun startLiveView()
     suspend fun stopLiveView()
     suspend fun frame(): ByteArray?
     suspend fun focus()
     suspend fun capture(autofocus: Boolean, onAccepted: () -> Unit = {}): CaptureReceipt
     suspend fun readParameters(): List<ShootingParameter> = emptyList()
+    suspend fun readParameterGroup(group: ShootingGroup): List<ShootingParameter> = readParameters().filter { it.setting.group == group }
     suspend fun setParameter(setting: ShootingSetting, value: Long): List<ShootingParameter> = error("当前连接未开放参数调节")
+    suspend fun setTextParameter(setting: ShootingSetting, value: String): List<ShootingParameter> = error("当前连接未开放文本参数调节")
     suspend fun close()
 }
 
@@ -44,6 +47,20 @@ class NikonRemoteCamera(private val operations: Set<Int>, private val properties
     private var recovering = false
     private var vendorProperties: Set<Int> = emptySet()
     private var vendorPropertiesRead = false
+    private var discoveryNotes = emptyList<String>()
+    override val parameterCoverage: String get() {
+        val known = properties.orEmpty() + vendorProperties
+        return buildString {
+            append("本版接入 ${ShootingSetting.entries.size} 项设置/状态；机身声明其中 ${ShootingSetting.entries.count { it.codes.any(known::contains) }} 项。")
+            append("发现 ${known.size} 个相机属性，未列出的属性不写入。\n")
+            ShootingGroup.entries.forEach { group ->
+                val items = ShootingSetting.entries.filter { it.group == group && it.codes.any(known::contains) }
+                append(group.title + "：" + items.joinToString("、") { it.title } + "\n")
+            }
+            if (discoveryNotes.isNotEmpty()) append(discoveryNotes.joinToString("\n") + "\n")
+            append("属性编号：" + known.sorted().joinToString(",") { "0x${it.toString(16)}" })
+        }
+    }
     private suspend fun send(op: Int, vararg args: Int) = command(op, args)
     private fun PtpReply.ok(action: String): PtpReply {
         if (code != 0x2001) throw IOException("$action：${remoteError(code)}")
@@ -120,7 +137,9 @@ class NikonRemoteCamera(private val operations: Set<Int>, private val properties
             if (reply.code != 0x2001) { lastReason = remoteError(reply.code); continue }
             val property = try { DeviceProperty.parse(reply.data, code) }
                 catch (error: Exception) { lastReason = error.message ?: "相机参数数据不可识别"; continue }
-            if (property.type != setting.type) { lastReason = "相机返回的参数类型暂不支持"; continue }
+            if (setting.type == 0 && property.type !in 1..6 || setting.type != 0 && property.type != setting.type) {
+                lastReason = "相机返回的参数类型暂不支持"; continue
+            }
             val item = ShootingParameter(setting, property,
                 if (0x1016 !in operations || dataCommand == null) "当前连接未开放参数写入" else null)
             if (item.editable) return item
@@ -128,37 +147,65 @@ class NikonRemoteCamera(private val operations: Set<Int>, private val properties
         }
         return readOnly ?: ShootingParameter(setting, reason = lastReason)
     }
-    private suspend fun parameters(): List<ShootingParameter> {
-        if (!vendorPropertiesRead && 0x90ca in operations) {
-            val reply = send(0x90ca)
-            if (reply.code == 0x2001) vendorProperties = runCatching { PtpData(reply.data).array16() }.getOrDefault(emptySet())
-            vendorPropertiesRead = true
+    private suspend fun discoverProperties() {
+        if (vendorPropertiesRead) return
+        val notes = mutableListOf<String>()
+        for (op in listOf(0x90ca,0x9439).filter(operations::contains)) {
+            val reply = if (op == 0x9439) send(op,0xd) else send(op)
+            if (reply.code != 0x2001) { notes += "扩展属性发现：${remoteError(reply.code)}"; continue }
+            val codes = try {
+                val p = java.nio.ByteBuffer.wrap(reply.data).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                val count = p.int.toLong() and 0xffffffffL
+                val width = if (op == 0x9439) 4 else 2
+                require(count <= 8192 && count * width == p.remaining().toLong()) { "扩展属性列表长度无效" }
+                List(count.toInt()) { if (width == 4) p.int else p.short.toInt() and 0xffff }.toSet().also {
+                    require(it.all { code -> code > 0 }) { "扩展属性编号无效" }
+                }
+            } catch (_: Exception) { notes += "扩展属性列表不可解析，保留标准属性"; emptySet() }
+            vendorProperties = vendorProperties + codes
         }
-        return ShootingSetting.entries.map { parameter(it) }
+        discoveryNotes = notes; vendorPropertiesRead = true
     }
-    override suspend fun readParameters(): List<ShootingParameter> = gate.withLock {
+    private suspend fun parameters(group: ShootingGroup): List<ShootingParameter> {
+        discoverProperties()
+        return ShootingSetting.entries.filter { it.group == group }.map { parameter(it) }
+    }
+    override suspend fun readParameters(): List<ShootingParameter> = readParameterGroup(ShootingGroup.COMMON)
+    override suspend fun readParameterGroup(group: ShootingGroup): List<ShootingParameter> = gate.withLock {
         check(capabilities.parameters) { "当前连接未开放拍摄参数读取" }
         prepare(); ready()
-        parameters()
+        parameters(group)
     }
     override suspend fun setParameter(setting: ShootingSetting, value: Long): List<ShootingParameter> = gate.withLock {
+        setValue(setting,value,null)
+    }
+    override suspend fun setTextParameter(setting: ShootingSetting, value: String): List<ShootingParameter> = gate.withLock {
+        setValue(setting,null,value)
+    }
+    private suspend fun setValue(setting: ShootingSetting, value: Long?, text: String?): List<ShootingParameter> {
         check(capabilities.parameters && 0x1016 in operations && dataCommand != null) { "当前连接未开放参数调节" }
         prepare(); ready()
+        discoverProperties()
         // Revalidate mode, lens, data type, access and supported values immediately before writing.
         val item = parameter(setting)
-        check(item.editable && value in item.options) { item.explanation ?: "参数选项已变化，请刷新后重新选择" }
+        check(item.editable && if (text != null) text in item.property?.textChoices.orEmpty() else value != null && item.accepts(value)) {
+            item.explanation ?: "参数选项已变化，请刷新后重新选择"
+        }
         val property = checkNotNull(item.property)
-        if (property.current != value) {
-            val reply = try { dataCommand.invoke(0x1016, intArrayOf(property.code), property.encode(value)) }
+        if (if (text != null) property.currentText != text else property.current != value) {
+            val data = if (text != null) property.encodeText(text) else property.encode(checkNotNull(value))
+            val reply = try { checkNotNull(dataCommand).invoke(0x1016, intArrayOf(property.code), data) }
                 catch (cancelled: CancellationException) { throw cancelled }
                 catch (error: Exception) { throw IOException("参数写入结果未确认，请刷新参数或重新连接后核对机身；不会自动重发", error) }
             reply.ok("设置${setting.title}")
             ready()
         }
-        val actual = parameters()
-        if (actual.first { it.setting == setting }.property?.current != value)
+        val actual = parameters(setting.group)
+        val confirmed = actual.first { it.setting == setting }.property
+        if (confirmed?.code != property.code || confirmed.type != property.type ||
+            (if (text != null) confirmed.currentText != text else confirmed.current != value))
             throw ParameterVerificationException(actual, "相机尚未确认所选${setting.title}，已显示重新读取的当前值；请检查模式和参数锁定")
-        actual
+        return actual
     }
     override suspend fun capture(autofocus: Boolean, onAccepted: () -> Unit): CaptureReceipt = gate.withLock {
         check(capabilities.capture) { "当前连接未开放遥控拍照" }

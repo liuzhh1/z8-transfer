@@ -82,7 +82,7 @@ class ShootingParametersTest {
         val rig = Rig(); assertTrue(rig.camera.capabilities.parameters); assertTrue(rig.calls.isEmpty())
         rig.camera.capture(false) {}; assertEquals(listOf(0x100e),rig.calls.map { it.first })
         val list = rig.camera.readParameters()
-        assertEquals(5,list.size); assertEquals("100",list.first { it.setting == ShootingSetting.ISO }.currentLabel)
+        assertEquals(6,list.size); assertEquals("100",list.first { it.setting == ShootingSetting.ISO }.currentLabel)
         assertTrue(rig.writes.isEmpty())
     }
     @Test fun writesOnceWithCorrectTypeAndDisplaysCameraReadback() = runTest {
@@ -132,9 +132,9 @@ class ShootingParametersTest {
                 else -> PtpReply(0x200a)
             }
         }
-        assertEquals(0xd100,camera.readParameters().first().property!!.code)
+        assertEquals(0xd100,camera.readParameters().first { it.setting == ShootingSetting.SHUTTER }.property!!.code)
         nikonWorks = false
-        assertEquals(0x500d,camera.readParameters().first().property!!.code)
+        assertEquals(0x500d,camera.readParameters().first { it.setting == ShootingSetting.SHUTTER }.property!!.code)
     }
     @Test fun vendorPropertyListDiscoversNikonShutterWithoutScanningObjects() = runTest {
         val calls = mutableListOf<Int>()
@@ -144,7 +144,7 @@ class ShootingParametersTest {
             else PtpReply(0x2001,propertyBytes(args[0],6,0x100fa,listOf(0x100fa,0x101f4)))
         }
         assertTrue(calls.isEmpty())
-        assertEquals("1/250 s",camera.readParameters().first().currentLabel)
+        assertEquals("1/250 s",camera.readParameters().first { it.setting == ShootingSetting.SHUTTER }.currentLabel)
         camera.readParameters()
         assertEquals(1,calls.count { it == 0x90ca }); assertTrue(calls.all { it == 0x90ca || it == 0x1014 })
     }

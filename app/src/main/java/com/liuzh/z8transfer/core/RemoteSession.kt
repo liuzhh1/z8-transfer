@@ -16,11 +16,14 @@ sealed interface RemoteAction {
     data object Focus : RemoteAction
     data class Capture(val autofocus: Boolean) : RemoteAction
     data object ReadParameters : RemoteAction
+    data class ReadParameterGroup(val group: ShootingGroup) : RemoteAction
     data class SetParameter(val setting: ShootingSetting, val value: Long) : RemoteAction
+    data class SetTextParameter(val setting: ShootingSetting, val value: String) : RemoteAction
 }
 data class RemoteStatus(val busy: Boolean = false, val live: Boolean = false,
     val message: String = "", val error: String? = null, val captureBlocked: Boolean = false,
-    val parameters: List<ShootingParameter> = emptyList(), val parametersLoaded: Boolean = false)
+    val parameters: List<ShootingParameter> = emptyList(), val parametersLoaded: Boolean = false,
+    val parameterGroup: ShootingGroup = ShootingGroup.COMMON, val parameterCoverage: String? = null)
 class CaptureUncertainException(message: String, cause: Throwable) : IOException(message, cause)
 
 /** One foreground session serializes frame polling, focus and shutter. No shutter is replayed. */
@@ -39,15 +42,23 @@ class RemoteSession(private val camera: RemoteCamera) {
         fun publish(value: RemoteStatus) { status = value; onState(value) }
         suspend fun execute(action: RemoteAction) {
             if (action is RemoteAction.Capture && status.captureBlocked) { pending.set(false); return }
-            if (action == RemoteAction.ReadParameters || action is RemoteAction.SetParameter)
-                status = status.copy(parameters = emptyList(), parametersLoaded = false)
+            val group = when (action) {
+                RemoteAction.ReadParameters -> ShootingGroup.COMMON
+                is RemoteAction.ReadParameterGroup -> action.group
+                is RemoteAction.SetParameter -> action.setting.group
+                is RemoteAction.SetTextParameter -> action.setting.group
+                else -> null
+            }
+            if (group != null) status = status.copy(parameters = emptyList(), parametersLoaded = false,parameterGroup = group)
             publish(status.copy(busy = true, error = null, message = when (action) {
                 RemoteAction.Start -> "正在开启实时取景…"
                 RemoteAction.Pause -> "正在暂停取景…"
                 RemoteAction.Focus -> "正在自动对焦…"
                 is RemoteAction.Capture -> "正在发送拍照指令…"
                 RemoteAction.ReadParameters -> "正在读取相机拍摄参数…"
+                is RemoteAction.ReadParameterGroup -> "正在读取${action.group.title}参数…"
                 is RemoteAction.SetParameter -> "正在设置${action.setting.title}并核对相机…"
+                is RemoteAction.SetTextParameter -> "正在设置${action.setting.title}并核对相机…"
             }))
             try {
                 when (action) {
@@ -55,9 +66,13 @@ class RemoteSession(private val camera: RemoteCamera) {
                     RemoteAction.Pause -> { camera.stopLiveView(); publish(status.copy(live = false, message = "实时取景已暂停")) }
                     RemoteAction.Focus -> { camera.focus(); publish(status.copy(message = "对焦指令已完成")) }
                     RemoteAction.ReadParameters -> publish(status.copy(parameters = camera.readParameters(),
-                        parametersLoaded = true, message = "已读取相机拍摄参数"))
+                        parametersLoaded = true, parameterCoverage = camera.parameterCoverage, message = "已读取相机拍摄参数"))
+                    is RemoteAction.ReadParameterGroup -> publish(status.copy(parameters = camera.readParameterGroup(action.group),
+                        parametersLoaded = true,parameterCoverage = camera.parameterCoverage,message = "已读取${action.group.title}参数"))
                     is RemoteAction.SetParameter -> publish(status.copy(parameters = camera.setParameter(action.setting, action.value),
-                        parametersLoaded = true, message = "${action.setting.title}已由相机确认"))
+                        parametersLoaded = true,parameterCoverage = camera.parameterCoverage,message = "${action.setting.title}已由相机确认"))
+                    is RemoteAction.SetTextParameter -> publish(status.copy(parameters = camera.setTextParameter(action.setting, action.value),
+                        parametersLoaded = true,parameterCoverage = camera.parameterCoverage,message = "${action.setting.title}已由相机确认"))
                     is RemoteAction.Capture -> {
                         val receipt = camera.capture(action.autofocus) {
                             onAccepted()

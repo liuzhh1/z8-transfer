@@ -93,4 +93,28 @@ class RemoteSessionTest {
         session.submit(RemoteAction.Capture(false)); advanceTimeBy(130); runCurrent()
         assertEquals(1,c.calls.count { it == "capture" }); job.cancelAndJoin()
     }
+    @Test fun groupedReadsAndTextWritesPreserveGroupAndConfirmedText() = runTest {
+        val camera = object : RemoteCamera {
+            override val capabilities = RemoteCapabilities(false,true,false,true)
+            override val parameterCoverage = "capability report"
+            var size = "8256x5504"
+            fun parameter() = listOf(ShootingParameter(ShootingSetting.IMAGE_SIZE,DeviceProperty(0x5003,0xffff,true,0,emptyList(),
+                currentText=size,textChoices=listOf("8256x5504","6192x4128"))))
+            override suspend fun readParameterGroup(group: ShootingGroup): List<ShootingParameter> { assertEquals(ShootingGroup.QUALITY,group); return parameter() }
+            override suspend fun setTextParameter(setting: ShootingSetting,value: String): List<ShootingParameter> { size=value; return parameter() }
+            override suspend fun startLiveView() = Unit
+            override suspend fun stopLiveView() = Unit
+            override suspend fun frame(): ByteArray? = null
+            override suspend fun focus() = Unit
+            override suspend fun capture(autofocus: Boolean,onAccepted: () -> Unit) = CaptureReceipt(true,"ok")
+            override suspend fun close() = Unit
+        }
+        val session = RemoteSession(camera); var status = RemoteStatus()
+        val job = launch { session.run({status=it},{},{},{throw it}) }; runCurrent()
+        session.submit(RemoteAction.ReadParameterGroup(ShootingGroup.QUALITY)); runCurrent()
+        assertEquals(ShootingGroup.QUALITY,status.parameterGroup); assertEquals("capability report",status.parameterCoverage)
+        session.submit(RemoteAction.SetTextParameter(ShootingSetting.IMAGE_SIZE,"6192x4128")); runCurrent()
+        assertEquals("6192x4128",status.parameters.single().currentLabel); assertTrue(status.parametersLoaded); assertFalse(status.busy)
+        job.cancelAndJoin()
+    }
 }

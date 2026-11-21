@@ -367,6 +367,7 @@ class ScreenTest {
     @Test fun remoteParametersLoadOnlyOnTapAndSelectionSendsExactCameraValue() {
         val iso = ShootingParameter(ShootingSetting.ISO,DeviceProperty(0x500f,4,true,100,listOf(100,200,400)))
         val parameters = listOf(
+            ShootingParameter(ShootingSetting.MODE,DeviceProperty(0x500e,4,true,1,listOf(1,2,3,4))),
             ShootingParameter(ShootingSetting.SHUTTER,DeviceProperty(0xd100,6,true,0x100fa,listOf(0x100fa,0x101f4))),
             ShootingParameter(ShootingSetting.APERTURE,DeviceProperty(0x5007,4,true,400,listOf(400,560))), iso,
             ShootingParameter(ShootingSetting.EXPOSURE,DeviceProperty(0x5010,3,true,0,listOf(-333,0,333))),
@@ -381,11 +382,13 @@ class ScreenTest {
         assertTrue(actions.isEmpty())
         compose.onNodeWithTag("remote-parameters").performClick()
         assertEquals(listOf(RemoteAction.ReadParameters),actions)
+        compose.onNodeWithTag("parameter-MODE").assertIsDisplayed()
+        compose.onNodeWithTag("parameter-EXPOSURE").assertIsDisplayed()
         compose.onNodeWithTag("shooting-parameters-panel").assertIsDisplayed()
         val frame = compose.onNodeWithTag("live-view-frame").fetchSemanticsNode().boundsInRoot
         assertTrue("Parameter panel must leave room for the live image",frame.height > frame.width * .35f)
         compose.onNodeWithTag("remote-shutter").assertIsDisplayed().assertIsEnabled()
-        compose.onNodeWithTag("parameter-ISO").performClick()
+        compose.onNodeWithTag("parameter-ISO").performScrollTo().performClick()
         compose.onNodeWithTag("parameter-value-200").performScrollTo().performClick()
         assertEquals(RemoteAction.SetParameter(ShootingSetting.ISO,200),actions.last())
         // No optimistic value is displayed before a camera readback.
@@ -393,7 +396,7 @@ class ScreenTest {
         compose.runOnIdle { remote = remote.copy(status = remote.status.copy(parameters=parameters.map {
             if (it.setting == ShootingSetting.ISO) iso.copy(property=iso.property!!.copy(current=200)) else it })) }
         compose.onNodeWithTag("parameter-ISO").assertTextContains("200",substring=true)
-        snapshot("v070-remote-parameters")
+        snapshot("v080-remote-parameters")
         compose.onNodeWithText("返回取景").performClick()
         compose.onNodeWithTag("remote-shutter").assertIsDisplayed().assertIsEnabled()
     }
@@ -420,6 +423,65 @@ class ScreenTest {
         compose.onNodeWithText("刷新").assertIsEnabled()
         compose.onNodeWithText("返回取景").performClick()
         compose.onNodeWithTag("remote-shutter").assertIsEnabled()
+    }
+    @Test fun modePickerAndGroupTabsUseCameraValuesWithoutHidingShutter() {
+        val mode = ShootingParameter(ShootingSetting.MODE,DeviceProperty(0x500e,4,true,1,listOf(1,2,3,4)))
+        var remote by mutableStateOf(com.liuzh.z8transfer.RemoteUiState(open=true,status=RemoteStatus()))
+        val actions = mutableListOf<RemoteAction>()
+        compose.setContent { Z8Theme { RemoteCameraContent(remote,RemoteCapabilities(true,true,true,true),{ action ->
+            actions += action
+            if (action == RemoteAction.ReadParameters) remote=remote.copy(status=remote.status.copy(parameters=listOf(mode),parametersLoaded=true))
+            if (action is RemoteAction.ReadParameterGroup) remote=remote.copy(status=remote.status.copy(parameterGroup=action.group,parameters=emptyList(),parametersLoaded=true))
+        },{}) } }
+        compose.onNodeWithTag("remote-parameters").performClick()
+        compose.onNodeWithTag("parameter-MODE").performClick()
+        compose.onNodeWithText("M · 手动").assertIsDisplayed()
+        compose.onNodeWithTag("parameter-value-3").performScrollTo().performClick()
+        assertEquals(RemoteAction.SetParameter(ShootingSetting.MODE,3),actions.last())
+        compose.onNodeWithTag("remote-shutter").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithTag("parameter-group-VIDEO").performScrollTo().performClick()
+        assertEquals(RemoteAction.ReadParameterGroup(ShootingGroup.VIDEO),actions.last())
+        compose.onNodeWithTag("remote-shutter").assertIsNotEnabled()
+        compose.onNodeWithText("视频设置需先",substring=true).assertIsDisplayed()
+        compose.onNodeWithTag("parameter-group-COMMON").performScrollTo().performClick()
+        compose.onNodeWithTag("remote-shutter").assertIsEnabled()
+    }
+    @Test fun rangeEditorRejectsOutOfRangeInputAndAppliesExactKelvin() {
+        val kelvin = ShootingParameter(ShootingSetting.COLOR_TEMPERATURE,DeviceProperty(0xd01e,4,true,6500,emptyList(),PropertyRange(2500,10000,1)))
+        var remote by mutableStateOf(com.liuzh.z8transfer.RemoteUiState(open=true,status=RemoteStatus()))
+        val actions = mutableListOf<RemoteAction>()
+        compose.setContent { Z8Theme { RemoteCameraContent(remote,RemoteCapabilities(true,true,true,true),{ action ->
+            actions += action
+            if (action is RemoteAction.ReadParameterGroup) remote=remote.copy(status=remote.status.copy(parameterGroup=action.group,parameters=listOf(kelvin),parametersLoaded=true))
+        },{}) } }
+        compose.onNodeWithTag("remote-parameters").performClick()
+        compose.onNodeWithTag("parameter-group-COLOR").performScrollTo().performClick()
+        compose.onNodeWithTag("parameter-COLOR_TEMPERATURE").performClick()
+        compose.onNodeWithTag("parameter-range-input").performTextReplacement("10001")
+        compose.onNodeWithTag("parameter-range-apply").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithTag("parameter-range-input").performScrollTo().performTextReplacement("7601")
+        compose.onNodeWithTag("parameter-range-apply").performScrollTo().assertIsEnabled().performClick()
+        assertEquals(RemoteAction.SetParameter(ShootingSetting.COLOR_TEMPERATURE,7601),actions.last())
+    }
+    @Test fun stringSizePickerAndCoverageReportRemainReviewable() {
+        val size = ShootingParameter(ShootingSetting.IMAGE_SIZE,DeviceProperty(0x5003,0xffff,true,0,emptyList(),currentText="8256x5504",textChoices=listOf("8256x5504","6192x4128")))
+        var remote by mutableStateOf(com.liuzh.z8transfer.RemoteUiState(open=true,status=RemoteStatus()))
+        val actions = mutableListOf<RemoteAction>()
+        compose.setContent { Z8Theme { RemoteCameraContent(remote,RemoteCapabilities(true,true,true,true),{ action ->
+            actions += action
+            if (action is RemoteAction.ReadParameterGroup) remote=remote.copy(status=remote.status.copy(parameterGroup=action.group,
+                parameters=listOf(size),parametersLoaded=true,parameterCoverage="本版接入 65 项设置/状态。\n属性编号：0x5003"))
+        },{}) } }
+        compose.onNodeWithTag("remote-parameters").performClick()
+        compose.onNodeWithTag("parameter-group-QUALITY").performScrollTo().performClick()
+        compose.onNodeWithTag("parameter-IMAGE_SIZE").performClick()
+        compose.onNodeWithTag("parameter-text-6192x4128").performClick()
+        assertEquals(RemoteAction.SetTextParameter(ShootingSetting.IMAGE_SIZE,"6192x4128"),actions.last())
+        compose.onNodeWithText("能力").performClick()
+        compose.onNodeWithText("本版接入 65 项设置/状态。",substring=true).assertIsDisplayed()
+        compose.onNodeWithText("复制完整报告").performClick()
+        val clipboard = compose.activity.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        assertTrue(clipboard.primaryClip!!.getItemAt(0).text.toString().contains("0x5003"))
     }
 
     @Test fun deletingSwipedPreviewTargetsCurrentFileRatherThanInitialFile() {
