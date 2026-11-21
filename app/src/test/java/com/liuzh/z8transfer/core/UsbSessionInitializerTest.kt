@@ -19,6 +19,14 @@ class UsbSessionInitializerTest {
     private fun info() = PtpReply(0x2001, deviceInfo)
     private fun ok() = PtpReply(0x2001)
     private fun stores() = PtpReply(0x2001, u32(1) + u32(0x10001))
+    @Test fun deviceInfoPreservesPropertyCodesSeparatelyFromEventsAndFormats() {
+        val bytes = u16(100) + u32(0x0a) + u16(100) + string("Nikon") + u16(0) +
+            u32(1) + u16(0x1014) + u32(1) + u16(0x4006) +
+            u32(2) + u16(0x500f) + u16(0xd100) + u32(1) + u16(0x3801) + u32(0) +
+            string("Nikon") + string("Z 8") + string("3.00") + string("test")
+        val info = PtpDeviceInfo.parse(bytes)
+        assertEquals(setOf(0x1014),info.operations); assertEquals(setOf(0x500f,0xd100),info.properties)
+    }
     private class Script(vararg replies: PtpReply) {
         val remaining = ArrayDeque(replies.toList())
         val operations = mutableListOf<Int>()

@@ -7,7 +7,8 @@ import kotlinx.coroutines.sync.withLock
 import java.io.IOException
 
 /** Camera operations advertised by this connection; capabilities are never inferred from model name. */
-data class RemoteCapabilities(val liveView: Boolean = false, val capture: Boolean = false, val autofocus: Boolean = false) {
+data class RemoteCapabilities(val liveView: Boolean = false, val capture: Boolean = false, val autofocus: Boolean = false,
+    val parameters: Boolean = false) {
     val available: Boolean get() = liveView || capture
 }
 data class CaptureReceipt(val ready: Boolean, val message: String)
@@ -18,6 +19,8 @@ interface RemoteCamera {
     suspend fun frame(): ByteArray?
     suspend fun focus()
     suspend fun capture(autofocus: Boolean, onAccepted: () -> Unit = {}): CaptureReceipt
+    suspend fun readParameters(): List<ShootingParameter> = emptyList()
+    suspend fun setParameter(setting: ShootingSetting, value: Long): List<ShootingParameter> = error("当前连接未开放参数调节")
     suspend fun close()
 }
 
@@ -25,18 +28,22 @@ interface RemoteCamera {
  * This implements control sequences only; the transport owns serialization and network/USB framing.
  * Capture always targets the memory card and is issued exactly once, including on ambiguous I/O errors.
  */
-class NikonRemoteCamera(private val operations: Set<Int>,
+class NikonRemoteCamera(private val operations: Set<Int>, private val properties: Set<Int>? = null,
+    private val dataCommand: (suspend (Int, IntArray, ByteArray) -> PtpReply)? = null,
     private val command: suspend (Int, IntArray) -> PtpReply) : RemoteCamera {
     override val capabilities = RemoteCapabilities(
         liveView = setOf(0x9201, 0x9202, 0x9203).all(operations::contains),
         capture = 0x9207 in operations || 0x100e in operations,
         autofocus = 0x90c1 in operations,
+        parameters = 0x1014 in operations,
     )
     private val gate = Mutex()
     private var controlOwned = false
     private var live = false
     private var startAttempted = false
     private var recovering = false
+    private var vendorProperties: Set<Int> = emptySet()
+    private var vendorPropertiesRead = false
     private suspend fun send(op: Int, vararg args: Int) = command(op, args)
     private fun PtpReply.ok(action: String): PtpReply {
         if (code != 0x2001) throw IOException("$action：${remoteError(code)}")
@@ -103,6 +110,56 @@ class NikonRemoteCamera(private val operations: Set<Int>,
         ready(40)
     }
     override suspend fun focus() = gate.withLock { autofocus() }
+
+    private suspend fun parameter(setting: ShootingSetting): ShootingParameter {
+        var lastReason = "当前连接未开放此参数"
+        var readOnly: ShootingParameter? = null
+        for (code in setting.codes) {
+            if (properties != null && code !in properties && code !in vendorProperties) continue
+            val reply = send(0x1014, code)
+            if (reply.code != 0x2001) { lastReason = remoteError(reply.code); continue }
+            val property = try { DeviceProperty.parse(reply.data, code) }
+                catch (error: Exception) { lastReason = error.message ?: "相机参数数据不可识别"; continue }
+            if (property.type != setting.type) { lastReason = "相机返回的参数类型暂不支持"; continue }
+            val item = ShootingParameter(setting, property,
+                if (0x1016 !in operations || dataCommand == null) "当前连接未开放参数写入" else null)
+            if (item.editable) return item
+            if (readOnly == null) readOnly = item
+        }
+        return readOnly ?: ShootingParameter(setting, reason = lastReason)
+    }
+    private suspend fun parameters(): List<ShootingParameter> {
+        if (!vendorPropertiesRead && 0x90ca in operations) {
+            val reply = send(0x90ca)
+            if (reply.code == 0x2001) vendorProperties = runCatching { PtpData(reply.data).array16() }.getOrDefault(emptySet())
+            vendorPropertiesRead = true
+        }
+        return ShootingSetting.entries.map { parameter(it) }
+    }
+    override suspend fun readParameters(): List<ShootingParameter> = gate.withLock {
+        check(capabilities.parameters) { "当前连接未开放拍摄参数读取" }
+        prepare(); ready()
+        parameters()
+    }
+    override suspend fun setParameter(setting: ShootingSetting, value: Long): List<ShootingParameter> = gate.withLock {
+        check(capabilities.parameters && 0x1016 in operations && dataCommand != null) { "当前连接未开放参数调节" }
+        prepare(); ready()
+        // Revalidate mode, lens, data type, access and supported values immediately before writing.
+        val item = parameter(setting)
+        check(item.editable && value in item.options) { item.explanation ?: "参数选项已变化，请刷新后重新选择" }
+        val property = checkNotNull(item.property)
+        if (property.current != value) {
+            val reply = try { dataCommand.invoke(0x1016, intArrayOf(property.code), property.encode(value)) }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (error: Exception) { throw IOException("参数写入结果未确认，请刷新参数或重新连接后核对机身；不会自动重发", error) }
+            reply.ok("设置${setting.title}")
+            ready()
+        }
+        val actual = parameters()
+        if (actual.first { it.setting == setting }.property?.current != value)
+            throw ParameterVerificationException(actual, "相机尚未确认所选${setting.title}，已显示重新读取的当前值；请检查模式和参数锁定")
+        actual
+    }
     override suspend fun capture(autofocus: Boolean, onAccepted: () -> Unit): CaptureReceipt = gate.withLock {
         check(capabilities.capture) { "当前连接未开放遥控拍照" }
         prepare(); ready()
@@ -142,6 +199,10 @@ class NikonRemoteCamera(private val operations: Set<Int>,
 fun remoteError(code: Int): String = when (code) {
     0x2019 -> "相机忙，请稍后重试"
     0x2005 -> "当前连接不支持此功能"
+    0x200a -> "相机未开放此参数"
+    0x201b -> "相机不接受此参数的数据格式，请刷新或重新连接"
+    0x201c -> "相机不接受此参数值，请刷新可用选项"
+    0x201d -> "相机拒绝了请求参数，请刷新并检查机身模式和镜头"
     0x200c -> "存储卡已满"
     0x200f -> "访问被拒绝，请检查相机连接及控制模式"
     0xa002 -> "未能合焦，请检查镜头与对焦模式"
@@ -149,6 +210,8 @@ fun remoteError(code: Int): String = when (code) {
     0xa00b -> "相机未处于实时取景状态"
     else -> "相机返回 0x${code.toString(16)}"
 }
+
+class ParameterVerificationException(val actual: List<ShootingParameter>, message: String) : IOException(message)
 
 /** Nikon live-view data includes a model-specific header before the JPEG. */
 fun liveViewJpeg(payload: ByteArray): ByteArray {

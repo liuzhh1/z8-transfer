@@ -1,3 +1,60 @@
+# Z8 Transfer v0.7.0：遥控拍摄参数调节
+
+日期：2026-11-21。基于 0.6.0 提交 `5454fee531dbc290ee45dc8120ddde8906a79623`。
+
+## 新行为
+
+- 遥控页内调节快门、光圈、ISO、曝光补偿、白平衡。点击「拍摄参数」时读取，进入遥控本身不会额外等待参数、照片列表或缩略图加载。
+- 参数面板位于同一页面，限制占用高度，上方实时画面和下方快门仍可见；可返回取景或用系统返回键收起。
+- 仅使用设备声明的标准/尼康厂商属性。读取 DevicePropDesc 当前值、类型、读写权限和枚举/范围；不预设镜头光圈，不改 P/A/S/M、自动 ISO、释放模式、白平衡微调或具体色温。
+- 尼康快门优先使用 D100 的分子/分母编码，标准曝光时间作为回退。特殊 B 门、Time、闪光同步档不提供选择，保留机身控制。
+- 每次写入前重新读取描述符，复核可写和可选值。USB 发送同事务数据容器；PTP/IP 使用 data-phase 2、StartData、EndData。一次写入后回读五项参数；相机拒绝、连接丢失或回读不一致时不显示虚假的成功、不自动重发写入。
+- 参数读取/写入与取景、对焦、快门在同一会话串行执行。操作期间快门禁用；正常完成后继续取景。机身改变设置后点「刷新」同步，显示值标记为「已读取」。
+- 仍仅显式进入「下载照片」才枚举文件，参数操作与拍照均不扫描相册。保留照片浏览、删除、预览、批选、六列和翻页手柄等既有功能。
+
+## 自动化验证
+
+```bash
+./gradlew --max-workers=2 :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
+```
+
+**160 项测试全部通过，Lint 0 错误（6 条 GradleDependency 更新提示），Debug APK 构建成功。** APK 签名与 16 KiB 对齐检查通过。
+
+新增/扩展检查涵盖有符号与无符号属性、精确快门档位、范围展开上限、只读和畸形描述符、尼康厂商属性发现、修改前权限变化、写入一次与真实回读、不确定结果无重发、USB/PTP-IP 出站容器与事务编号、Wi-Fi 完整调参链路、参数与取景/快门串行、控制器零相册扫描，以及参数面板的选择、只读提示、失败刷新和可见快门。
+
+| 测试集 | 用例数 | 结果 |
+|---|---:|---|
+| CameraNavigationTest | 10 | 全通过 |
+| DeletionEngineTest | 7 | 全通过 |
+| NikonFocusMetadataTest | 4 | 全通过 |
+| PhotoBrowserTest | 3 | 全通过 |
+| PtpIpProtocolTest | 16 | 全通过 |
+| PtpProtocolTest | 13 | 全通过 |
+| RemoteCameraTest | 10 | 全通过 |
+| RemoteSessionTest | 5 | 全通过 |
+| ShootingParametersTest | 13 | 全通过 |
+| TransferEngineTest | 17 | 全通过 |
+| UsbSessionInitializerTest | 20 | 全通过 |
+| ScreenTest | 33 | 全通过 |
+| WifiDeletionTest | 5 | 全通过 |
+| WifiRouteTest | 4 | 全通过 |
+
+## 安装包校验
+
+- 文件：`Z8Transfer-v0.7.0.apk`
+- 大小：29,009,784 字节
+- 包名：`com.liuzh.z8transfer.wifi`，versionName 0.7.0 / versionCode 9。
+- SHA-256：`61eec3b77bc58c726ccb867cef2ef9ee4529cdcd66a442c3927fa3aed2862967`
+- 签名证书 SHA-256：`513855ef2625e9748888bf597768d9e056b297b80ec592e09d950203c45e398e`，沿用 0.6.0 测试签名，可覆盖安装。
+
+## 实机边界与协议依据
+
+本次没有连接真实 Z8 或手机，没有实际修改机身参数、触发快门或删除文件。选项、可写性和实时生效效果取决于固件、P/A/S/M、镜头、自动 ISO、机身锁定及当前连接模式；设备拒绝时显示原因，请先在机身检查。调参期间取景请求会短暂停顿，未承诺零延迟或固定帧率。Android 系统 MTP 继续不提供遥控与参数控制，请使用相机开放能力的 Wi-Fi / 标准 USB PTP；标准 PTP 的既有手机兼容性问题保留。
+
+编码和指令核对来源：[libgphoto2 ptp.h](https://github.com/gphoto/libgphoto2/blob/master/camlibs/ptp2/ptp.h)、[config.c](https://github.com/gphoto/libgphoto2/blob/master/camlibs/ptp2/config.c)、[ptp.c](https://github.com/gphoto/libgphoto2/blob/master/camlibs/ptp2/ptp.c)、[ptpip.c](https://github.com/gphoto/libgphoto2/blob/master/camlibs/ptp2/ptpip.c)。没有引入该项目的代码依赖。
+
+---
+
 # Z8 Transfer v0.6.0：遥控与下载独立页面，按需加载相册
 
 日期：2026-11-21。基于 0.5.0 提交 `b365cecc3c38a630774bdd59a5450ad6a2f81027`。

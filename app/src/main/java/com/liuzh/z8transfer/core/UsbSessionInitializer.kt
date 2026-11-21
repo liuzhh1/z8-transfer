@@ -5,13 +5,14 @@ import kotlinx.coroutines.delay
 import java.io.IOException
 
 data class PtpDeviceInfo(val manufacturer: String, val model: String, val version: String,
-    val serial: String, val operations: Set<Int>) {
+    val serial: String, val operations: Set<Int>, val properties: Set<Int> = emptySet()) {
     companion object {
         fun parse(bytes: ByteArray): PtpDeviceInfo {
             val p = PtpData(bytes)
             p.u16(); p.u32(); p.u16(); p.string(); p.u16()
-            val operations = p.array16(); repeat(4) { p.array16() }
-            return PtpDeviceInfo(p.string(), p.string(), p.string(), p.string(), operations)
+            val operations = p.array16(); p.array16()
+            val properties = p.array16(); repeat(2) { p.array16() }
+            return PtpDeviceInfo(p.string(), p.string(), p.string(), p.string(), operations, properties)
         }
     }
 }

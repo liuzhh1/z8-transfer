@@ -33,7 +33,16 @@ class PtpProtocol(private val pipe: PtpPipe, private val bufferSize: Int = 128 *
     @Volatile private var broken = false
 
     fun command(operation: Int, parameters: IntArray = intArrayOf(), expected: Long? = null,
-        sink: ((ByteArray, Int, Int) -> Unit)? = null): PtpReply {
+        sink: ((ByteArray, Int, Int) -> Unit)? = null): PtpReply = transact(operation, parameters, expected, sink, null)
+
+    /** Small device-property payloads only; uses a data container with the same transaction. */
+    fun commandWithData(operation: Int, parameters: IntArray, data: ByteArray): PtpReply {
+        require(data.size in 1..65536)
+        return transact(operation, parameters, null, null, data)
+    }
+
+    private fun transact(operation: Int, parameters: IntArray, expected: Long?,
+        sink: ((ByteArray, Int, Int) -> Unit)?, dataOut: ByteArray?): PtpReply {
         check(!broken) { "USB 会话已失效，请重新连接" }
         require(parameters.size <= 5)
         val id = if (sessionOpen) ++transaction else 0
@@ -41,14 +50,22 @@ class PtpProtocol(private val pipe: PtpPipe, private val bufferSize: Int = 128 *
             .putInt(12 + parameters.size * 4).putShort(1).putShort(operation.toShort()).putInt(id)
         parameters.forEach(request::putInt)
         try {
-            var sent = 0
-            while (sent < request.array().size) {
-                val n = pipe.write(request.array(), sent, request.array().size - sent)
-                if (n <= 0) throw IOException("USB 命令发送失败")
-                sent += n
+            fun write(bytes: ByteArray) {
+                var sent = 0
+                while (sent < bytes.size) {
+                    val n = pipe.write(bytes, sent, bytes.size - sent)
+                    if (n <= 0 || n > bytes.size - sent) throw IOException("USB 命令或参数发送失败")
+                    sent += n
+                }
+            }
+            write(request.array())
+            if (dataOut != null) {
+                write(ByteBuffer.allocate(12 + dataOut.size).order(ByteOrder.LITTLE_ENDIAN)
+                    .putInt(12 + dataOut.size).putShort(2).putShort(operation.toShort()).putInt(id).put(dataOut).array())
             }
             var header = header()
             verifyId(header, id)
+            check(dataOut == null || header.type == 3) { "相机参数写入响应格式无效" }
             var count = 0L
             val output = if (sink == null) ByteArrayOutputStream() else null
             if (header.type == 2) {

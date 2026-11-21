@@ -53,8 +53,18 @@ class CameraNavigationTest {
         var failScan = false
         @Volatile var scanning = false
         var files = listOf(photo(1))
+        val parameterReads = java.util.concurrent.atomic.AtomicInteger()
+        val parameterWrites = java.util.concurrent.atomic.AtomicInteger()
         override val remoteControl = object : RemoteCamera {
-            override val capabilities = RemoteCapabilities(true,true,true)
+            override val capabilities = RemoteCapabilities(true,true,true,true)
+            override suspend fun readParameters(): List<ShootingParameter> {
+                parameterReads.incrementAndGet()
+                return listOf(ShootingParameter(ShootingSetting.ISO,DeviceProperty(0x500f,4,true,100,listOf(100,200))))
+            }
+            override suspend fun setParameter(setting: ShootingSetting, value: Long): List<ShootingParameter> {
+                parameterWrites.incrementAndGet()
+                return listOf(ShootingParameter(setting,DeviceProperty(0x500f,4,true,value,listOf(100,200))))
+            }
             override suspend fun startLiveView() = wire.withLock { check(!scanning); starts.incrementAndGet(); Unit }
             override suspend fun stopLiveView() = Unit
             override suspend fun frame(): ByteArray? = null
@@ -110,6 +120,17 @@ class CameraNavigationTest {
         controller.selectPage(CameraPage.REMOTE); connect()
         await { it.remote.status.live }
         assertEquals(1,source.starts.get()); assertEquals(0,source.scans.get())
+    }
+    @Test fun parameterControlsStayInsideRemoteSessionWithoutPhotoEnumeration() = runBlocking {
+        connect(); await { it.connected }; controller.openRemote(); await { it.remote.status.live && !it.remote.busy }
+        assertEquals(0,source.parameterReads.get())
+        controller.remoteAction(RemoteAction.ReadParameters); await { it.remote.status.parametersLoaded && !it.remote.busy }
+        assertEquals(1,source.parameterReads.get()); assertEquals(0,source.scans.get())
+        controller.remoteAction(RemoteAction.SetParameter(ShootingSetting.ISO,200))
+        await { it.remote.status.parameters.firstOrNull()?.property?.current == 200L && !it.remote.busy }
+        controller.remoteAction(RemoteAction.Capture(false)); await { source.captures.get() == 1 && !it.remote.busy }
+        controller.closeRemote(); await { !it.remote.open }
+        assertEquals(1,source.parameterWrites.get()); assertEquals(0,source.scans.get())
     }
     @Test fun selectingDownloadsBeforeConnectingIsAnExplicitScanRequest() = runBlocking {
         controller.selectPage(CameraPage.PHOTOS); connect()

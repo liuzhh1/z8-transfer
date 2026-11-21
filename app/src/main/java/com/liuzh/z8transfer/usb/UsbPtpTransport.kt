@@ -24,6 +24,7 @@ class UsbPtpTransport private constructor(
     private val identity: String,
     private val operations: Set<Int>,
     override val diagnostics: String,
+    private val properties: Set<Int> = emptySet(),
 ) : CameraTransport {
     override val connectionLabel: String = "USB · 标准 PTP"
     override val sessionId: String = UUID.randomUUID().toString()
@@ -35,7 +36,9 @@ class UsbPtpTransport private constructor(
 
     override val remoteUnavailableReason: String = "相机未在此标准 PTP 会话声明遥控指令，请检查相机模式，或尝试 Wi-Fi 连接"
     override val remoteControl: RemoteCamera? = if (displayName.contains("Nikon", ignoreCase = true))
-        NikonRemoteCamera(operations) { op, args -> withContext(Dispatchers.IO) {
+        NikonRemoteCamera(operations, properties, { op, args, data -> withContext(Dispatchers.IO) {
+            gate.withLock { checkLive(); protocol.commandWithData(op, args, data) }
+        } }) { op, args -> withContext(Dispatchers.IO) {
             gate.withLock { checkLive(); protocol.command(op, args) }
         } } else null
 
@@ -193,7 +196,7 @@ class UsbPtpTransport private constructor(
                     "设备信息来源：${if (info != null) "PTP DeviceInfo" else "USB 描述符（已验证存储卡可访问）"}\n" +
                     "USB 删除：${if (0x100b in operations) "已声明支持" else "未声明支持，禁用删除"}\n" +
                     "初始化可见存储卡：${initialized.storageIds.size}\n" + initialized.notes.joinToString("\n") + "\n" + describeUsbConnection(device)
-                UsbPtpTransport(device, protocol, name, identity, operations, diagnostic)
+                UsbPtpTransport(device, protocol, name, identity, operations, diagnostic, info?.properties.orEmpty())
             } catch (error: Exception) {
                 if (protocol.usable && protocol.hasSession) runCatching { protocol.command(0x1003) }
                 protocol.close(); throw error

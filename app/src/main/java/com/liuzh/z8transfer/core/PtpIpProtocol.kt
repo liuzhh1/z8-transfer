@@ -45,14 +45,26 @@ class PtpIpProtocol private constructor(
 
     /** Serialized by the camera transport. A normal PTP error does not corrupt the channel. */
     fun command(operation: Int, parameters: IntArray = intArrayOf(), expected: Long? = null,
-        sink: ((ByteArray, Int, Int) -> Unit)? = null): PtpReply {
+        sink: ((ByteArray, Int, Int) -> Unit)? = null): PtpReply = transact(operation, parameters, expected, sink, null)
+
+    fun commandWithData(operation: Int, parameters: IntArray, data: ByteArray): PtpReply {
+        require(data.size in 1..65536)
+        return transact(operation, parameters, null, null, data)
+    }
+
+    private fun transact(operation: Int, parameters: IntArray, expected: Long?,
+        sink: ((ByteArray, Int, Int) -> Unit)?, dataOut: ByteArray?): PtpReply {
         check(usable) { "Wi-Fi 会话已断开，请重新连接" }
         require(parameters.size <= 5 && (expected == null || expected >= 0))
         val id = if (sessionOpen) ++transaction else 0
-        val request = little(10 + parameters.size * 4).putInt(1).putShort(operation.toShort()).putInt(id)
+        val request = little(10 + parameters.size * 4).putInt(if (dataOut == null) 1 else 2).putShort(operation.toShort()).putInt(id)
         parameters.forEach(request::putInt)
         try {
             commandChannel.send(6, request.array())
+            if (dataOut != null) {
+                commandChannel.send(9, little(12).putInt(id).putLong(dataOut.size.toLong()).array())
+                commandChannel.send(12, little(4 + dataOut.size).putInt(id).put(dataOut).array())
+            }
             val output = if (sink == null) ByteArrayOutputStream() else null
             var count = 0L
             var declared: Long? = null
@@ -64,6 +76,7 @@ class PtpIpProtocol private constructor(
                     13 -> { check(header.length == 8L); commandChannel.send(14) }
                     14 -> check(header.length == 8L)
                     9 -> {
+                        check(dataOut == null) { "相机参数写入响应格式无效" }
                         check(!started && header.length == 20L) { "无效的 Wi-Fi 数据起始包" }
                         val p = little(commandChannel.bytes(12))
                         check(p.int == id) { "相机事务编号不匹配" }

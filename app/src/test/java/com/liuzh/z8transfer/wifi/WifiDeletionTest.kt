@@ -62,7 +62,7 @@ class WifiDeletionTest {
             string("A.JPG") + string("") + string("")
         return wireFixture(data(1, card) + data(2, info) + response(3, deleteCode), if (supports) setOf(0x100b) else emptySet())
     }
-    private fun wireFixture(replies: ByteArray, operations: Set<Int>): Fixture {
+    private fun wireFixture(replies: ByteArray, operations: Set<Int>, properties: Set<Int> = emptySet()): Fixture {
         val guid = ByteArray(16)
         val ack = frame(2, le(4).putInt(7).array() + guid + "Z8\u0000".toByteArray(Charsets.UTF_16LE) + le(4).putInt(0x10000).array())
         val command = FakeSocket(ByteArrayInputStream(ack + response(0) + replies))
@@ -73,12 +73,33 @@ class WifiDeletionTest {
         val context: Context = ApplicationProvider.getApplicationContext()
         val routeCtor = WifiRoute::class.java.declaredConstructors.first { it.parameterCount == 3 }.apply { isAccessible = true }
         val route = routeCtor.newInstance(context.getSystemService(ConnectivityManager::class.java), ShadowNetwork.newInstance(108), WifiEndpoint("192.168.1.1")) as WifiRoute
-        val ctor = WifiPtpTransport::class.java.declaredConstructors.first { it.parameterCount == 6 }.apply { isAccessible = true }
-        val source = ctor.newInstance(route, protocol, "Nikon Z8", "identity", operations, "") as WifiPtpTransport
+        val ctor = WifiPtpTransport::class.java.declaredConstructors.first { it.parameterCount == 7 }.apply { isAccessible = true }
+        val source = ctor.newInstance(route, protocol, "Nikon Z8", "identity", operations, "", properties) as WifiPtpTransport
         return Fixture(source, protocol, command)
     }
     private fun photo(source: WifiPtpTransport) = CameraPhoto(source.sessionId, "identity", 1, "card:1000", "CF", 77,
         "DCIM/100", "A.JPG", 100, 0, 0, PhotoKind.JPEG, parentHandle = 42)
+
+    @Test fun wifiParameterControlUsesDataOutAndReadbackWithoutFileCommands() = runTest {
+        fun iso(value: Long) = com.liuzh.z8transfer.core.propertyBytes(0x500f,4,value,listOf(100,200))
+        wireFixture(data(1,iso(100)) + data(2,iso(100)) + response(3) + data(4,iso(200)),
+            setOf(0x1014,0x1016,0x100e),setOf(0x500f)).use { f ->
+            val c = checkNotNull(f.source.remoteControl)
+            assertTrue(c.capabilities.parameters)
+            assertEquals("100",c.readParameters().first { it.setting == ShootingSetting.ISO }.currentLabel)
+            assertEquals("200",c.setParameter(ShootingSetting.ISO,200).first { it.setting == ShootingSetting.ISO }.currentLabel)
+            val b = ByteBuffer.wrap(f.socket.output.toByteArray()).order(ByteOrder.LITTLE_ENDIAN)
+            b.position(b.int)
+            val operations = mutableListOf<Int>()
+            while (b.hasRemaining()) {
+                val at = b.position(); val size = b.int; val type = b.int
+                if (type == 6) { b.int; operations += b.short.toInt() and 65535 }
+                b.position(at + size)
+            }
+            assertEquals(listOf(0x1002,0x1014,0x1014,0x1016,0x1014),operations)
+            assertTrue(f.protocol.usable)
+        }
+    }
 
     @Test fun supportedWifiDeleteRevalidatesCardAndObjectThenDeletesExactlyOneHandle() = runTest {
         fixture().use { f ->

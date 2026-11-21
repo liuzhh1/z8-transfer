@@ -12,6 +12,15 @@ class RemoteSessionTest {
         val calls = mutableListOf<String>()
         var bytes: ByteArray? = byteArrayOf(1)
         var captureError: Exception? = null
+        var parameterError: Exception? = null
+        override suspend fun readParameters(): List<ShootingParameter> {
+            calls += "read"; parameterError?.let { throw it }
+            return listOf(ShootingParameter(ShootingSetting.ISO,DeviceProperty(0x500f,4,true,100,listOf(100,200))))
+        }
+        override suspend fun setParameter(setting: ShootingSetting, value: Long): List<ShootingParameter> {
+            calls += "set"; delay(300); parameterError?.let { throw it }
+            return listOf(ShootingParameter(setting,DeviceProperty(0x500f,4,true,value,listOf(100,200))))
+        }
         override suspend fun startLiveView() { calls += "start" }
         override suspend fun stopLiveView() { calls += "stop" }
         override suspend fun frame(): ByteArray? { calls += "frame"; return bytes }
@@ -54,5 +63,34 @@ class RemoteSessionTest {
         assertTrue(c.calls.contains("stop"))
         session.submit(RemoteAction.Start); runCurrent(); assertTrue(status.live)
         job.cancelAndJoin(); assertEquals("close",c.calls.last())
+    }
+    @Test fun parametersLoadLazilyAndWritesSerializeWithFramePollingAndShutter() = runTest {
+        val c = Camera(); val session = RemoteSession(c); var status = RemoteStatus()
+        val job = launch { session.run({status=it},{},{},{throw it}) }
+        runCurrent(); advanceTimeBy(250); runCurrent()
+        assertFalse(c.calls.contains("read")); assertFalse(c.calls.contains("set"))
+        session.submit(RemoteAction.ReadParameters); advanceTimeBy(130); runCurrent()
+        assertTrue(status.parametersLoaded); assertEquals(100L,status.parameters.single().property!!.current)
+        session.submit(RemoteAction.SetParameter(ShootingSetting.ISO,200)); advanceTimeBy(130); runCurrent()
+        assertTrue(status.busy); assertTrue(status.parameters.isEmpty())
+        val frames = c.calls.count { it == "frame" }
+        assertFalse(session.submit(RemoteAction.Capture(false)))
+        advanceTimeBy(100); runCurrent(); assertEquals(frames,c.calls.count { it == "frame" })
+        advanceTimeBy(400); runCurrent()
+        assertEquals(200L,status.parameters.single().property!!.current); assertFalse(status.busy); assertTrue(status.live)
+        session.submit(RemoteAction.Capture(false)); advanceTimeBy(130); runCurrent()
+        assertEquals(1,c.calls.count { it == "capture" })
+        job.cancelAndJoin()
+    }
+    @Test fun parameterFailureClearsUnverifiedValuesAndKeepsShutterAvailable() = runTest {
+        val c = Camera(); val session = RemoteSession(c); var status = RemoteStatus()
+        val job = launch { session.run({status=it},{},{},{throw it}) }
+        runCurrent(); session.submit(RemoteAction.ReadParameters); advanceTimeBy(130); runCurrent()
+        c.parameterError = IOException("read failed")
+        session.submit(RemoteAction.ReadParameters); advanceTimeBy(130); runCurrent()
+        assertEquals("read failed",status.error); assertFalse(status.parametersLoaded); assertTrue(status.parameters.isEmpty())
+        assertFalse(status.captureBlocked); assertTrue(status.live)
+        session.submit(RemoteAction.Capture(false)); advanceTimeBy(130); runCurrent()
+        assertEquals(1,c.calls.count { it == "capture" }); job.cancelAndJoin()
     }
 }

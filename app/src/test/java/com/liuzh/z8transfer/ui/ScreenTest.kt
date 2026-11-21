@@ -364,6 +364,63 @@ class ScreenTest {
         compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.CREATED)
         assertTrue(closes.get() > 0)
     }
+    @Test fun remoteParametersLoadOnlyOnTapAndSelectionSendsExactCameraValue() {
+        val iso = ShootingParameter(ShootingSetting.ISO,DeviceProperty(0x500f,4,true,100,listOf(100,200,400)))
+        val parameters = listOf(
+            ShootingParameter(ShootingSetting.SHUTTER,DeviceProperty(0xd100,6,true,0x100fa,listOf(0x100fa,0x101f4))),
+            ShootingParameter(ShootingSetting.APERTURE,DeviceProperty(0x5007,4,true,400,listOf(400,560))), iso,
+            ShootingParameter(ShootingSetting.EXPOSURE,DeviceProperty(0x5010,3,true,0,listOf(-333,0,333))),
+            ShootingParameter(ShootingSetting.WHITE_BALANCE,DeviceProperty(0x5005,4,true,2,listOf(2,4,0x8010))))
+        var remote by mutableStateOf(com.liuzh.z8transfer.RemoteUiState(open = true,status = RemoteStatus(live=true)))
+        val actions = mutableListOf<RemoteAction>()
+        compose.setContent { Z8Theme { RemoteCameraContent(remote,RemoteCapabilities(true,true,true,true), { action ->
+            actions += action
+            if (action == RemoteAction.ReadParameters) remote = remote.copy(status = remote.status.copy(parameters=parameters,parametersLoaded=true))
+        }, {}) } }
+        compose.onNodeWithTag("remote-shutter").assertIsDisplayed().assertIsEnabled()
+        assertTrue(actions.isEmpty())
+        compose.onNodeWithTag("remote-parameters").performClick()
+        assertEquals(listOf(RemoteAction.ReadParameters),actions)
+        compose.onNodeWithTag("shooting-parameters-panel").assertIsDisplayed()
+        val frame = compose.onNodeWithTag("live-view-frame").fetchSemanticsNode().boundsInRoot
+        assertTrue("Parameter panel must leave room for the live image",frame.height > frame.width * .35f)
+        compose.onNodeWithTag("remote-shutter").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithTag("parameter-ISO").performClick()
+        compose.onNodeWithTag("parameter-value-200").performScrollTo().performClick()
+        assertEquals(RemoteAction.SetParameter(ShootingSetting.ISO,200),actions.last())
+        // No optimistic value is displayed before a camera readback.
+        compose.onNodeWithTag("parameter-ISO").assertTextContains("100",substring=true)
+        compose.runOnIdle { remote = remote.copy(status = remote.status.copy(parameters=parameters.map {
+            if (it.setting == ShootingSetting.ISO) iso.copy(property=iso.property!!.copy(current=200)) else it })) }
+        compose.onNodeWithTag("parameter-ISO").assertTextContains("200",substring=true)
+        snapshot("v070-remote-parameters")
+        compose.onNodeWithText("返回取景").performClick()
+        compose.onNodeWithTag("remote-shutter").assertIsDisplayed().assertIsEnabled()
+    }
+    @Test fun readOnlyParameterExplainsModeRestrictionAndCannotOpenChoices() {
+        val aperture = ShootingParameter(ShootingSetting.APERTURE,DeviceProperty(0x5007,4,false,400,listOf(400,560)))
+        var remote by mutableStateOf(com.liuzh.z8transfer.RemoteUiState(open=true,
+            status=RemoteStatus(parameters=listOf(aperture),parametersLoaded=true)))
+        compose.setContent { Z8Theme { RemoteCameraContent(remote,RemoteCapabilities(true,true,true,true),{}, {}) } }
+        compose.onNodeWithTag("remote-parameters").performClick()
+        compose.onNodeWithTag("parameter-APERTURE").assertIsNotEnabled()
+        compose.onNodeWithText("相机设为只读",substring=true).assertIsDisplayed()
+        compose.onNodeWithTag("parameter-value-400").assertDoesNotExist()
+        compose.runOnIdle { remote=remote.copy(pending=true) }
+        compose.onNodeWithText("刷新").assertIsNotEnabled()
+    }
+    @Test fun unavailableParameterConnectionAndReadFailureLeaveExplicitRecovery() {
+        var caps by mutableStateOf(RemoteCapabilities(true,true,true))
+        var remote by mutableStateOf(com.liuzh.z8transfer.RemoteUiState(open=true))
+        compose.setContent { Z8Theme { RemoteCameraContent(remote,caps,{}, {}) } }
+        compose.onNodeWithTag("remote-parameters").assertIsNotEnabled()
+        compose.runOnIdle { caps=caps.copy(parameters=true); remote=remote.copy(status=RemoteStatus(error="相机忙")) }
+        compose.onNodeWithTag("remote-parameters").performClick()
+        compose.onNodeWithText("读取未完成，请点刷新重试").assertIsDisplayed()
+        compose.onNodeWithText("刷新").assertIsEnabled()
+        compose.onNodeWithText("返回取景").performClick()
+        compose.onNodeWithTag("remote-shutter").assertIsEnabled()
+    }
 
     @Test fun deletingSwipedPreviewTargetsCurrentFileRatherThanInitialFile() {
         val first = photo(1,"A.JPG",PhotoKind.JPEG); val second = photo(2,"B.JPG",PhotoKind.JPEG)
