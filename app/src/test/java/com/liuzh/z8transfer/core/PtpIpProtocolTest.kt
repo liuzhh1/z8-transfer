@@ -15,6 +15,28 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 class PtpIpProtocolTest {
+    @Test fun propertyWriteUsesOutgoingPhaseStartAndEndPacketsAndPreservesErrorSession() {
+        val (p,socket,_) = connection(response(0) + response(1,0x201d) + response(2))
+        p.use {
+            p.command(0x1002,intArrayOf(1)).requireOk()
+            assertEquals(0x201d,p.commandWithData(0x1016,intArrayOf(0x500f),byteArrayOf(-56,0)).code)
+            assertTrue(p.usable)
+            p.command(0x90c8).requireOk()
+            val raw = ByteBuffer.wrap(socket.sent.toByteArray()).order(ByteOrder.LITTLE_ENDIAN)
+            raw.position(raw.int)
+            val session = raw.position(); val n = raw.int; raw.position(session + n)
+            val actual = ByteArray(raw.remaining()).also(raw::get)
+            val request = frame(6,le(14).putInt(2).putShort(0x1016).putInt(1).putInt(0x500f).array())
+            val ending = frame(6,le(10).putInt(1).putShort(0x90c8.toShort()).putInt(2).array())
+            assertArrayEquals(request + start(1,2) + data(1,byteArrayOf(-56,0)) + ending,actual)
+        }
+    }
+    @Test fun propertyWriteResponseMismatchAbortsBothSocketsWithoutReplay() {
+        val (p,command,event) = connection(response(0) + response(9))
+        p.command(0x1002,intArrayOf(1)).requireOk()
+        assertThrows(Exception::class.java) { p.commandWithData(0x1016,intArrayOf(0x500f),byteArrayOf(100,0)) }
+        assertFalse(p.usable); assertTrue(command.wasClosed); assertTrue(event.wasClosed)
+    }
     private fun le(n: Int) = ByteBuffer.allocate(n).order(ByteOrder.LITTLE_ENDIAN)
     private fun frame(type: Int, body: ByteArray = byteArrayOf(), length: Long = body.size + 8L) =
         le(8 + body.size).putInt(length.toInt()).putInt(type).put(body).array()

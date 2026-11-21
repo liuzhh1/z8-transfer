@@ -27,6 +27,8 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.input.nestedscroll.*
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
@@ -81,7 +83,7 @@ fun Z8Screen(controller: AppController, onConnect: () -> Unit, onDownload: (Bool
     TransferContent(state, onConnect, controller::disconnect, controller::refresh, controller::toggle,
         controller::selectVisible, controller::clearSelection, onDownload, controller::requestStop,
         controller::dismissError, controller::thumbnail, controller::preview, controller::videoPreview, onDelete, onImmersiveChange,
-        controller::connectWifi, onWifiSettings, controller.lastWifiEndpoint(), controller::selectUsbMode)
+        controller::connectWifi, onWifiSettings, controller.lastWifiEndpoint(), controller::selectUsbMode, controller::setSelection, controller::focusRegion, controller::openRemote, controller::remoteAction, controller::closeRemote, controller::selectPage)
 }
 
 @Composable
@@ -96,6 +98,10 @@ internal fun TransferContent(
     onWifiConnect: (WifiEndpoint) -> Unit = {}, onWifiSettings: () -> Unit = {},
     wifiEndpoint: WifiEndpoint = WifiEndpoint(),
     onUsbModeChange: (UsbConnectionMode) -> Unit = {},
+    onSelectionChange: ((Set<String>) -> Unit)? = null,
+    focusRegion: suspend (CameraPhoto) -> FocusRegion? = { null },
+    onOpenRemote: () -> Unit = {}, onRemoteAction: (RemoteAction) -> Unit = {}, onCloseRemote: () -> Unit = {},
+    onPageChange: (CameraPage) -> Unit = {},
 ) {
     var category by rememberSaveable { mutableStateOf("全部") }
     var card by rememberSaveable { mutableStateOf<Int?>(null) }
@@ -103,6 +109,9 @@ internal fun TransferContent(
     var query by rememberSaveable { mutableStateOf("") }
     var collapsed by rememberSaveable { mutableStateOf(false) }
     var columns by rememberSaveable { mutableIntStateOf(2) }
+    var sortName by rememberSaveable { mutableStateOf(PhotoSort.NEWEST.name) }
+    var showFocus by rememberSaveable { mutableStateOf(false) }
+    val sort = PhotoSort.valueOf(sortName)
     var wifi by remember { mutableStateOf(false) }
     var info by remember { mutableStateOf(false) }
     var report by remember { mutableStateOf(false) }
@@ -111,21 +120,43 @@ internal fun TransferContent(
     var viewing by remember { mutableStateOf<Pair<List<CameraPhoto>, Int>?>(null) }
     val grid = rememberLazyGridState()
     val selected = remember(state.photos, state.selected) { state.photos.filter { it.key in state.selected } }
-    val visible = remember(state.photos, category, card, day, query) {
-        state.photos.filter { p ->
+    val visible = remember(state.photos, category, card, day, query, sort) {
+        sort.apply(state.photos.filter { p ->
             (when (category) { "照片" -> p.kind.isPhoto; "视频" -> p.kind.isVideo; "N-RAW" -> p.kind == PhotoKind.NEV;
+                "RAW" -> p.kind == PhotoKind.RAW; "JPEG" -> p.kind == PhotoKind.JPEG;
                 "其他" -> p.kind == PhotoKind.OTHER; else -> true }) &&
                 (card == null || p.storageId == card) && (day == "所有日期" || date(p.sortTime, "yyyy-MM-dd") == day) &&
                 p.name.contains(query, true)
+        })
+    }
+    LaunchedEffect(category, card, day, query, sortName) { grid.scrollToItem(0) }
+    val selectionGesture = Modifier.dragSelect(grid, visible, state.selected, !state.busy) { keys ->
+        if (onSelectionChange != null) onSelectionChange(keys) else {
+            state.photos.filter { (it.key in keys) != (it.key in state.selected) }.forEach(onToggle)
         }
     }
-    val immersive = state.connected && collapsed || viewing != null
+    val immersive = state.connected && collapsed || viewing != null || state.remote.open
     LaunchedEffect(immersive) { onImmersiveChange(immersive) }
     DisposableEffect(Unit) { onDispose { onImmersiveChange(false) } }
     LaunchedEffect(state.cameraName) {
         card = null; day = "所有日期"
         if (!state.connected) { collapsed = false; viewing = null }
     }
+    LaunchedEffect(state.photos, state.connected, state.scanning) {
+        val old = viewing ?: return@LaunchedEffect
+        if (!state.connected || state.scanning) { viewing = null; return@LaunchedEffect }
+        val keys = state.photos.map { it.key }.toSet()
+        val remaining = old.first.filter { it.key in keys }
+        if (remaining != old.first) {
+            val currentKey = old.first.getOrNull(old.second)?.key
+            val next = remaining.indexOfFirst { it.key == currentKey }.takeIf { it >= 0 }
+                ?: old.second.coerceAtMost((remaining.size - 1).coerceAtLeast(0))
+            viewing = remaining.takeIf { it.isNotEmpty() }?.let { it to next }
+        }
+    }
+    LaunchedEffect(state.page) { collapsed = false; viewing = null; deletionPlan = null }
+    BackHandler(state.page != CameraPage.HOME && viewing == null && !collapsed && !state.remote.open) { onPageChange(CameraPage.HOME) }
+    BackHandler(state.remote.open && !state.switchingPage) { onPageChange(CameraPage.HOME) }
     BackHandler(collapsed && viewing == null) { collapsed = false }
     val threshold = with(LocalDensity.current) { 32.dp.toPx() }
     var upward by remember { mutableFloatStateOf(0f) }
@@ -146,144 +177,188 @@ internal fun TransferContent(
             }
         }
     }
-    val hasDock = selected.isNotEmpty() || state.progress.running || state.deletion.running
+    val hasDock = state.page == CameraPage.PHOTOS && (selected.isNotEmpty() || state.progress.running || state.deletion.running)
     Box(Modifier.fillMaxSize().background(Paper).then(if (!collapsed) Modifier.safeDrawingPadding() else Modifier)) {
-        Column(Modifier.fillMaxSize()) {
-            if (!collapsed) Column(Modifier.fillMaxWidth().padding(horizontal = 18.dp).testTag("browser-tools")) {
-                Row(Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text("Z8 Transfer", fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                    if (state.connected) TextButton(onClick = { collapsed = true }) { Text("全屏浏览", fontSize = 12.sp) }
-                    else TextButton(onClick = { wifi = true }, enabled = !state.busy) { Text("Wi-Fi 连接", fontSize = 12.sp) }
-                }
-                Surface(color = Ink, shape = RoundedCornerShape(17.dp)) {
-                    Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text(state.cameraName ?: "Nikon Z8", color = Color.White, fontSize = 17.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text(if (state.connected) "● ${state.connectionLabel} 已连接 · 照片与视频" else "USB 或 Wi-Fi · 原文件传输", color = Lime, fontSize = 10.sp)
+        if (state.remote.open) RemoteCameraContent(state.remote, state.remoteCapabilities, onRemoteAction,
+            onClose = { onPageChange(CameraPage.HOME) }, onBrowsePhotos = { onPageChange(CameraPage.PHOTOS) }, onStop = onCloseRemote)
+        else {
+            Column(Modifier.fillMaxSize()) {
+                if (!collapsed) Column(Modifier.fillMaxWidth().padding(horizontal = 18.dp).testTag("browser-tools")) {
+                    Row(Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Z8 Transfer", fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        if (state.connected && state.page == CameraPage.PHOTOS) {
+                            TextButton(onClick = { collapsed = true }) { Text("全屏浏览", fontSize = 12.sp) }
                         }
-                        Button(onClick = if (state.connected) onRefresh else onConnect, enabled = !state.busy,
-                            colors = ButtonDefaults.buttonColors(containerColor = Lime, contentColor = Ink), contentPadding = PaddingValues(horizontal = 12.dp)) {
-                            Text(if (state.connecting) "连接中…" else if (state.connected) "刷新" else "连接相机", fontSize = 12.sp)
-                        }
-                        if (state.connected) {
-                            var menu by remember { mutableStateOf(false) }
-                            Box {
-                                TextButton(onClick = { menu = true }, modifier = Modifier.width(36.dp), contentPadding = PaddingValues(0.dp)) { Text("⋯", color = Lime, fontSize = 24.sp) }
-                                DropdownMenu(menu, { menu = false }) {
-                                    DropdownMenuItem(text = { Text("连接信息") }, onClick = { menu = false; info = true })
-                                    DropdownMenuItem(text = { Text("下载结果") }, onClick = { menu = false; report = true })
-                                    DropdownMenuItem(text = { Text("删除结果") }, onClick = { menu = false; deleteReport = true })
-                                    DropdownMenuItem(text = { Text("Wi-Fi 连接设置") }, enabled = !state.busy,
-                                        onClick = { menu = false; wifi = true })
-                                    DropdownMenuItem(text = { Text("断开相机") }, enabled = !state.busy, onClick = { menu = false; onDisconnect() })
+                        if (state.page != CameraPage.HOME) TextButton(onClick = { onPageChange(CameraPage.HOME) },
+                            enabled = !state.switchingPage && !state.progress.running && !state.deletion.running) { Text("首页", fontSize = 12.sp) }
+                        if (!state.connected) TextButton(onClick = { wifi = true }, enabled = !state.busy) { Text("Wi-Fi 连接", fontSize = 12.sp) }
+                    }
+                    Surface(color = Ink, shape = RoundedCornerShape(17.dp)) {
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(state.cameraName ?: "Nikon Z8", color = Color.White, fontSize = 17.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(if (state.connected) "● ${state.connectionLabel} 已连接 · 照片与视频" else "USB 或 Wi-Fi · 原文件传输", color = Lime, fontSize = 10.sp)
+                            }
+                            Button(onClick = if (!state.connected) onConnect else if (state.page == CameraPage.PHOTOS) onRefresh else onDisconnect,
+                                enabled = !state.busy,
+                                colors = ButtonDefaults.buttonColors(containerColor = Lime, contentColor = Ink), contentPadding = PaddingValues(horizontal = 12.dp)) {
+                                Text(if (state.connecting) "连接中…" else if (!state.connected) "连接相机" else if (state.page == CameraPage.PHOTOS) "刷新" else "断开", fontSize = 12.sp)
+                            }
+                            if (state.connected) {
+                                var menu by remember { mutableStateOf(false) }
+                                Box {
+                                    TextButton(onClick = { menu = true }, modifier = Modifier.width(36.dp), contentPadding = PaddingValues(0.dp)) { Text("⋯", color = Lime, fontSize = 24.sp) }
+                                    DropdownMenu(menu, { menu = false }) {
+                                        DropdownMenuItem(text = { Text("连接信息") }, onClick = { menu = false; info = true })
+                                        DropdownMenuItem(text = { Text("下载结果") }, onClick = { menu = false; report = true })
+                                        DropdownMenuItem(text = { Text("删除结果") }, onClick = { menu = false; deleteReport = true })
+                                        DropdownMenuItem(text = { Text("Wi-Fi 连接设置") }, enabled = !state.busy,
+                                            onClick = { menu = false; wifi = true })
+                                        DropdownMenuItem(text = { Text("断开相机") }, enabled = !state.busy, onClick = { menu = false; onDisconnect() })
+                                    }
                                 }
                             }
                         }
                     }
+                    Row(Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 4.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        listOf(CameraPage.REMOTE, CameraPage.PHOTOS).forEach { page ->
+                            val active = state.page == page
+                            OutlinedButton(onClick = { onPageChange(page) },
+                                enabled = !state.switchingPage && !state.progress.running && !state.deletion.running,
+                                colors = ButtonDefaults.outlinedButtonColors(containerColor = if (active) Lime else Color.Transparent),
+                                modifier = Modifier.weight(1f).testTag(if (page == CameraPage.REMOTE) "open-remote" else "open-photos")) {
+                                Text(page.label)
+                            }
+                        }
+                    }
+                    if (!state.connected) {
+                        var usbOptions by remember { mutableStateOf(false) }
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text("有线连接方式", fontSize = 12.sp, color = Muted, modifier = Modifier.weight(1f))
+                            Box {
+                                TextButton(onClick = { usbOptions = true }, enabled = !state.busy, modifier = Modifier.testTag("usb-mode-selector")) {
+                                    Text("${state.usbMode.label} ▾", fontSize = 12.sp)
+                                }
+                                DropdownMenu(usbOptions, { usbOptions = false }) {
+                                    UsbConnectionMode.entries.forEach { mode ->
+                                        DropdownMenuItem(text = { Text(mode.label) }, enabled = !state.busy,
+                                            onClick = { usbOptions = false; onUsbModeChange(mode) })
+                                    }
+                                }
+                            }
+                        }
+                        Text(if (state.usbMode == UsbConnectionMode.SYSTEM_MTP) "兼容性优先；大于等于 4 GiB 的文件暂不支持此模式" else
+                            "实验连接；若发送失败，请拔线重连并切回系统 MTP", fontSize = 10.sp, color = Muted)
+                    }
+                    if (state.connected && state.page == CameraPage.PHOTOS) {
+                        Row(Modifier.fillMaxWidth().padding(top = 7.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("相机文件", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                            Text("${visible.size}/${state.photos.size}", color = Muted, fontSize = 11.sp)
+                            FilterMenu("${columns}列", (1..6).map { it to "${it}列" }) { columns = it }
+                            FilterMenu("排序", PhotoSort.entries.map { it to it.label }) { sortName = it.name }
+                            TextButton(onClick = { onSelectVisible(visible) }, enabled = !state.busy && visible.isNotEmpty(), contentPadding = PaddingValues(7.dp)) {
+                                Text(if (visible.isNotEmpty() && visible.all { it.key in state.selected }) "取消全选" else "全选结果", fontSize = 11.sp)
+                            }
+                        }
+                        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                            listOf("全部", "照片", "RAW", "JPEG", "视频", "N-RAW", "其他").forEach { label ->
+                                FilterChip(category == label, { category = label }, label = { Text(label, fontSize = 12.sp) })
+                            }
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            val cards = state.photos.distinctBy { it.storageId }.map { it.storageId to "${it.storageLabel} · ${it.storageId.toUInt().toString(16)}" }
+                            FilterMenu(cards.firstOrNull { it.first == card }?.second ?: "所有存储卡", listOf(null to "所有存储卡") + cards) { card = it }
+                            val days = listOf("所有日期") + state.photos.map { date(it.sortTime, "yyyy-MM-dd") }.distinct().sortedDescending()
+                            FilterMenu(day, days.map { it to it }) { day = it }
+                            Spacer(Modifier.weight(1f))
+                            if (selected.isNotEmpty()) TextButton(onClick = onClearSelection, enabled = !state.busy) { Text("清空", fontSize = 11.sp) }
+                        }
+                        OutlinedTextField(query, { query = it }, singleLine = true, placeholder = { Text("搜索文件名", fontSize = 12.sp) },
+                            shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(52.dp))
+                        Text("点按预览 · 长按拖动批选 · 右侧手柄翻页", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(vertical = 8.dp))
+                        if (state.scanning) {
+                            LinearProgressIndicator(Modifier.fillMaxWidth())
+                            Text("读取列表中 · ${state.examined} 个项目", fontSize = 11.sp, color = Muted)
+                        }
+                    }
+                }
+                if (state.error != null && !collapsed) ErrorNotice(state.error, onDismissError)
+                if (state.connecting && !state.connected) {
+                    LinearProgressIndicator(Modifier.fillMaxWidth().padding(horizontal = 18.dp))
+                    Text("正在建立相机连接…", fontSize = 12.sp, color = Muted, modifier = Modifier.padding(18.dp, 8.dp))
                 }
                 if (!state.connected) {
-                    var usbOptions by remember { mutableStateOf(false) }
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text("有线连接方式", fontSize = 12.sp, color = Muted, modifier = Modifier.weight(1f))
-                        Box {
-                            TextButton(onClick = { usbOptions = true }, enabled = !state.busy, modifier = Modifier.testTag("usb-mode-selector")) {
-                                Text("${state.usbMode.label} ▾", fontSize = 12.sp)
+                    SetupGuide(Modifier.weight(1f))
+                } else if (state.page != CameraPage.PHOTOS) {
+                    Column(Modifier.weight(1f).fillMaxWidth().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                        Text(if (state.page == CameraPage.REMOTE) "遥控拍摄" else "相机已连接，选择功能", fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+                        if (state.switchingPage) {
+                            LinearProgressIndicator(Modifier.fillMaxWidth())
+                            Text("正在进入${state.page.label}…", color = Muted)
+                        } else if (state.page == CameraPage.REMOTE) {
+                            Text(if (state.remoteCapabilities.available) "直接开启实时取景和拍照，无需读取存储卡照片。" else state.remoteUnavailableReason,
+                                color = Muted, fontSize = 14.sp)
+                            Button(onClick = onOpenRemote, enabled = state.remoteCapabilities.available && !state.busy,
+                                modifier = Modifier.testTag("start-remote")) { Text("开始遥控拍摄") }
+                        } else {
+                            Text("遥控拍摄：直接进入取景、对焦和拍照。", color = Muted, fontSize = 15.sp)
+                            Text("下载照片：选择此页后才读取相片列表，支持预览、下载和删除。", color = Muted, fontSize = 15.sp)
+                        }
+                    }
+                } else if (visible.isEmpty()) {
+                    Box(Modifier.weight(1f).fillMaxWidth().nestedScroll(scrolling), contentAlignment = Alignment.Center) {
+                        Text(if (state.scanning) "正在读取相机文件…" else "没有符合条件的文件", color = Muted)
+                    }
+                } else Box(Modifier.weight(1f).fillMaxWidth()) {
+                    LazyVerticalGrid(GridCells.Fixed(columns), state = grid,
+                        modifier = Modifier.fillMaxSize().nestedScroll(scrolling).then(selectionGesture).testTag("file-grid"),
+                        horizontalArrangement = Arrangement.spacedBy(if (columns >= 4) 3.dp else 6.dp),
+                        verticalArrangement = Arrangement.spacedBy(if (columns >= 4) 4.dp else 8.dp),
+                        contentPadding = PaddingValues(start = if (collapsed) 4.dp else 12.dp, end = 40.dp,
+                            top = if (collapsed) 48.dp else 2.dp, bottom = if (hasDock) 144.dp else 16.dp)) {
+                        items(visible, key = { it.key }) { file ->
+                            FileTile(file, file.key in state.selected, file.key in state.downloaded, state.busy,
+                                state.scanning || state.progress.running || state.deletion.running, thumbnail,
+                                onSelect = { onToggle(file) }, onPreview = { viewing = visible.toList() to visible.indexOf(file) },
+                                compact = columns >= 4)
+                        }
+                    }
+                    if (visible.size > columns && (grid.canScrollBackward || grid.canScrollForward)) {
+                        GridPageHandle(grid, visible.size, columns)
+                    }
+                }
+            }
+            if (collapsed) Surface(color = Ink.copy(alpha = 0.88f), shape = RoundedCornerShape(30.dp),
+                modifier = Modifier.align(Alignment.TopEnd).safeDrawingPadding().padding(8.dp)) {
+                TextButton(onClick = { collapsed = false }) { Text("展开工具栏", color = Color.White, fontSize = 11.sp) }
+            }
+            if (hasDock) Surface(color = Paper, shadowElevation = 8.dp, shape = RoundedCornerShape(19.dp),
+                modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().navigationBarsPadding().padding(10.dp).testTag("selection-dock")) {
+                Column(Modifier.padding(horizontal = 13.dp, vertical = 9.dp)) {
+                    when {
+                        state.deletion.running -> {
+                            Text("正在删除相机文件 ${state.deletion.outcomes.size}/${state.deletion.total}", fontSize = 12.sp)
+                            Text(state.deletion.currentName, fontSize = 11.sp, color = Muted)
+                            TextButton(onClick = onStop) { Text("完成当前项后停止后续删除") }
+                        }
+                        state.progress.running -> {
+                            ProgressPanel(state.progress)
+                            TextButton(onClick = onStop, enabled = !state.progress.stopRequested) { Text(if (state.progress.stopRequested) "正在停止后续…" else "完成当前文件后停止") }
+                        }
+                        else -> {
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text("已选 ${selected.size} 个文件", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                                Text(selectionSize(selected), fontSize = 11.sp, color = Muted)
                             }
-                            DropdownMenu(usbOptions, { usbOptions = false }) {
-                                UsbConnectionMode.entries.forEach { mode ->
-                                    DropdownMenuItem(text = { Text(mode.label) }, enabled = !state.busy,
-                                        onClick = { usbOptions = false; onUsbModeChange(mode) })
-                                }
+                            Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                OutlinedButton(onClick = { deletionPlan = DeletionPlan(selected.first().sessionId, selected.toList()) },
+                                    enabled = state.connected && !state.busy && state.supportsDeletion,
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Danger), modifier = Modifier.weight(1f)) { Text("删除相机文件", fontSize = 12.sp) }
+                                Button(onClick = { onDownload(false) }, enabled = state.connected && !state.busy && state.storageReady,
+                                    modifier = Modifier.weight(1.25f)) { Text("下载 ${selected.size} 个原文件", fontSize = 12.sp) }
                             }
+                            if (!state.supportsDeletion) Text(state.deletionUnavailableReason, fontSize = 10.sp, color = Muted)
                         }
-                    }
-                    Text(if (state.usbMode == UsbConnectionMode.SYSTEM_MTP) "兼容性优先；大于等于 4 GiB 的文件暂不支持此模式" else
-                        "实验连接；若发送失败，请拔线重连并切回系统 MTP", fontSize = 10.sp, color = Muted)
-                }
-                if (state.connected) {
-                    Row(Modifier.fillMaxWidth().padding(top = 7.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text("相机文件", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                        Text("${visible.size}/${state.photos.size}", color = Muted, fontSize = 11.sp)
-                        TextButton(onClick = { columns = columns % 3 + 1 }, contentPadding = PaddingValues(7.dp)) { Text("${columns}列", fontSize = 11.sp) }
-                        TextButton(onClick = { onSelectVisible(visible) }, enabled = !state.busy && visible.isNotEmpty(), contentPadding = PaddingValues(7.dp)) {
-                            Text(if (visible.isNotEmpty() && visible.all { it.key in state.selected }) "取消全选" else "全选结果", fontSize = 11.sp)
-                        }
-                    }
-                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                        listOf("全部", "照片", "视频", "N-RAW", "其他").forEach { label ->
-                            FilterChip(category == label, { category = label }, label = { Text(label, fontSize = 12.sp) })
-                        }
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        val cards = state.photos.distinctBy { it.storageId }.map { it.storageId to "${it.storageLabel} · ${it.storageId.toUInt().toString(16)}" }
-                        FilterMenu(cards.firstOrNull { it.first == card }?.second ?: "所有存储卡", listOf(null to "所有存储卡") + cards) { card = it }
-                        val days = listOf("所有日期") + state.photos.map { date(it.sortTime, "yyyy-MM-dd") }.distinct().sortedDescending()
-                        FilterMenu(day, days.map { it to it }) { day = it }
-                        Spacer(Modifier.weight(1f))
-                        if (selected.isNotEmpty()) TextButton(onClick = onClearSelection, enabled = !state.busy) { Text("清空", fontSize = 11.sp) }
-                    }
-                    OutlinedTextField(query, { query = it }, singleLine = true, placeholder = { Text("搜索文件名", fontSize = 12.sp) },
-                        shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(52.dp))
-                    Text("点按全屏预览 · 勾选文件 · 上滑隐藏工具栏", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(vertical = 8.dp))
-                    if (state.scanning) {
-                        LinearProgressIndicator(Modifier.fillMaxWidth())
-                        Text("读取列表中 · ${state.examined} 个项目", fontSize = 11.sp, color = Muted)
-                    }
-                }
-            }
-            if (state.error != null && !collapsed) ErrorNotice(state.error, onDismissError)
-            if (state.connecting && !state.connected) {
-                LinearProgressIndicator(Modifier.fillMaxWidth().padding(horizontal = 18.dp))
-                Text("正在建立相机连接…", fontSize = 12.sp, color = Muted, modifier = Modifier.padding(18.dp, 8.dp))
-            }
-            if (!state.connected) {
-                SetupGuide(Modifier.weight(1f))
-            } else if (visible.isEmpty()) {
-                Box(Modifier.weight(1f).fillMaxWidth().nestedScroll(scrolling), contentAlignment = Alignment.Center) {
-                    Text(if (state.scanning) "正在读取相机文件…" else "没有符合条件的文件", color = Muted)
-                }
-            } else LazyVerticalGrid(GridCells.Fixed(columns), state = grid,
-                modifier = Modifier.weight(1f).fillMaxWidth().nestedScroll(scrolling).testTag("file-grid"),
-                horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(8.dp),
-                contentPadding = PaddingValues(start = if (collapsed) 4.dp else 12.dp, end = if (collapsed) 4.dp else 12.dp,
-                    top = if (collapsed) 48.dp else 2.dp, bottom = if (hasDock) 144.dp else 16.dp)) {
-                items(visible, key = { it.key }) { file ->
-                    FileTile(file, file.key in state.selected, file.key in state.downloaded, state.busy,
-                        state.scanning || state.progress.running || state.deletion.running, thumbnail,
-                        onSelect = { onToggle(file) }, onPreview = { viewing = visible.toList() to visible.indexOf(file) })
-                }
-            }
-        }
-        if (collapsed) Surface(color = Ink.copy(alpha = 0.88f), shape = RoundedCornerShape(30.dp),
-            modifier = Modifier.align(Alignment.TopEnd).safeDrawingPadding().padding(8.dp)) {
-            TextButton(onClick = { collapsed = false }) { Text("展开工具栏", color = Color.White, fontSize = 11.sp) }
-        }
-        if (hasDock) Surface(color = Paper, shadowElevation = 8.dp, shape = RoundedCornerShape(19.dp),
-            modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().navigationBarsPadding().padding(10.dp).testTag("selection-dock")) {
-            Column(Modifier.padding(horizontal = 13.dp, vertical = 9.dp)) {
-                when {
-                    state.deletion.running -> {
-                        Text("正在删除相机文件 ${state.deletion.outcomes.size}/${state.deletion.total}", fontSize = 12.sp)
-                        Text(state.deletion.currentName, fontSize = 11.sp, color = Muted)
-                        TextButton(onClick = onStop) { Text("完成当前项后停止后续删除") }
-                    }
-                    state.progress.running -> {
-                        ProgressPanel(state.progress)
-                        TextButton(onClick = onStop, enabled = !state.progress.stopRequested) { Text(if (state.progress.stopRequested) "正在停止后续…" else "完成当前文件后停止") }
-                    }
-                    else -> {
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("已选 ${selected.size} 个文件", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
-                            Text(selectionSize(selected), fontSize = 11.sp, color = Muted)
-                        }
-                        Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            OutlinedButton(onClick = { deletionPlan = DeletionPlan(selected.first().sessionId, selected.toList()) },
-                                enabled = state.connected && !state.busy && state.supportsDeletion,
-                                colors = ButtonDefaults.outlinedButtonColors(contentColor = Danger), modifier = Modifier.weight(1f)) { Text("删除相机文件", fontSize = 12.sp) }
-                            Button(onClick = { onDownload(false) }, enabled = state.connected && !state.busy && state.storageReady,
-                                modifier = Modifier.weight(1.25f)) { Text("下载 ${selected.size} 个原文件", fontSize = 12.sp) }
-                        }
-                        if (!state.supportsDeletion) Text(state.deletionUnavailableReason, fontSize = 10.sp, color = Muted)
                     }
                 }
             }
@@ -297,37 +372,48 @@ internal fun TransferContent(
     } else null)
     if (deleteReport) BasicDialog("相机删除结果", "已删除 ${state.deletion.deleted} · 未成功 ${state.deletion.failed}\n" +
         state.deletion.outcomes.joinToString("\n") { "${it.file.name}：${if (it.deleted) "已删除" else it.error}" }) { deleteReport = false }
-    deletionPlan?.let { plan ->
-        DeleteConfirmation(plan, state.connected && !state.busy, { deletionPlan = null }) {
-            deletionPlan = null; onDelete(plan)
+    viewing?.let { (files, initial) ->
+        key(files.map { it.key }) {
+            FullMediaViewer(files, initial, state, thumbnail, preview, videoPreview, onToggle, { viewing = null },
+                showFocus, { showFocus = it }, focusRegion,
+                onDeleteFile = { file -> deletionPlan = DeletionPlan(file.sessionId, listOf(file)) },
+                onCurrentIndex = { index -> viewing?.let { current -> if (current.first == files) viewing = files to index } })
         }
     }
-    viewing?.let { (files, initial) ->
-        FullMediaViewer(files, initial, state, thumbnail, preview, videoPreview, onToggle, { viewing = null })
+    // Confirmation must be above the viewer dialog, including when deleting its current photo.
+    deletionPlan?.let { plan ->
+        DeleteConfirmation(plan, state.connected && !state.busy && state.supportsDeletion, { deletionPlan = null },
+            onConfirm = { deletionPlan = null; onDelete(plan) },
+            companions = companionJpegs(plan.files, state.photos), onConfirmFiles = { files ->
+                deletionPlan = null; onDelete(DeletionPlan(plan.sessionId, files))
+            })
     }
+
 }
 
 @Composable
 private fun FileTile(file: CameraPhoto, selected: Boolean, downloaded: Boolean, busy: Boolean, paused: Boolean,
-    thumbnail: suspend (CameraPhoto) -> Bitmap?, onSelect: () -> Unit, onPreview: () -> Unit) {
+    thumbnail: suspend (CameraPhoto) -> Bitmap?, onSelect: () -> Unit, onPreview: () -> Unit, compact: Boolean = false) {
     var bitmap by remember(file.key) { mutableStateOf<Bitmap?>(null) }
     LaunchedEffect(file.key, paused) { if (!paused && bitmap == null) bitmap = thumbnail(file) }
     Column(Modifier.clip(RoundedCornerShape(13.dp)).background(Color.White)
         .border(if (selected) 2.dp else 1.dp, if (selected) Green else Color(0xFFE3E5DC), RoundedCornerShape(13.dp))
-        .combinedClickable(onClick = onPreview, onLongClick = { if (!busy) onSelect() })) {
+        .clickable(onClick = onPreview)) {
         Box(Modifier.fillMaxWidth().aspectRatio(1f).background(Color(0xFFE3E7DF))) {
             bitmap?.let { Image(it.asImageBitmap(), file.name, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
-                ?: Text(if (file.kind.isVideo) "▷" else "▧", fontSize = 46.sp, color = Muted, modifier = Modifier.align(Alignment.Center))
-            Surface(color = Ink.copy(alpha = 0.85f), shape = RoundedCornerShape(5.dp), modifier = Modifier.align(Alignment.TopStart).padding(6.dp)) {
-                Text(file.kind.label, color = Color.White, fontSize = 10.sp, modifier = Modifier.padding(5.dp))
+                ?: Text(if (file.kind.isVideo) "▷" else "▧", fontSize = if (compact) 22.sp else 46.sp, color = Muted, modifier = Modifier.align(Alignment.Center))
+            Surface(color = Ink.copy(alpha = 0.85f), shape = RoundedCornerShape(5.dp), modifier = Modifier.align(Alignment.TopStart).padding(if (compact) 2.dp else 6.dp)) {
+                Text(file.kind.label, color = Color.White, fontSize = if (compact) 7.sp else 10.sp, modifier = Modifier.padding(if (compact) 2.dp else 5.dp))
             }
-            Checkbox(selected, { onSelect() }, enabled = !busy,
-                modifier = Modifier.align(Alignment.TopEnd).background(Color.White.copy(alpha = 0.9f), RoundedCornerShape(bottomStart = 12.dp))
-                    .semantics { contentDescription = "选择 ${file.name}" })
+            CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides if (compact) 0.dp else 48.dp) {
+                Checkbox(selected, { onSelect() }, enabled = !busy,
+                    modifier = Modifier.align(Alignment.TopEnd).size(if (compact) 24.dp else 48.dp).background(Color.White.copy(alpha = 0.9f), RoundedCornerShape(bottomStart = 12.dp))
+                        .semantics { contentDescription = "选择 ${file.name}" })
+            }
         }
-        Column(Modifier.padding(9.dp)) {
-            Text(file.name, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text("${fileSize(file)} · ${date(file.sortTime, "MM-dd HH:mm")}", fontSize = 10.sp, color = Muted, modifier = Modifier.padding(top = 4.dp))
+        Column(Modifier.padding(if (compact) 3.dp else 9.dp)) {
+            Text(file.name, fontSize = if (compact) 8.sp else 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (!compact) Text("${fileSize(file)} · ${date(file.sortTime, "MM-dd HH:mm")}", fontSize = 10.sp, color = Muted, modifier = Modifier.padding(top = 4.dp))
             if (downloaded) Text("✓ 已下载", color = Green, fontSize = 10.sp)
         }
     }
@@ -336,9 +422,12 @@ private fun FileTile(file: CameraPhoto, selected: Boolean, downloaded: Boolean, 
 @Composable
 private fun FullMediaViewer(files: List<CameraPhoto>, initial: Int, state: AppState,
     thumbnail: suspend (CameraPhoto) -> Bitmap?, preview: suspend (CameraPhoto) -> Bitmap?,
-    videoPreview: suspend (CameraPhoto) -> String, onToggle: (CameraPhoto) -> Unit, onClose: () -> Unit) {
+    videoPreview: suspend (CameraPhoto) -> String, onToggle: (CameraPhoto) -> Unit, onClose: () -> Unit,
+    showFocus: Boolean, onShowFocus: (Boolean) -> Unit, focusRegion: suspend (CameraPhoto) -> FocusRegion?,
+    onDeleteFile: (CameraPhoto) -> Unit, onCurrentIndex: (Int) -> Unit) {
     val pager = rememberPagerState(initialPage = initial, pageCount = { files.size })
     val scope = rememberCoroutineScope()
+    LaunchedEffect(pager.currentPage) { onCurrentIndex(pager.currentPage) }
     var currentScale by remember { mutableFloatStateOf(1f) }
     var showInfo by remember { mutableStateOf(false) }
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
@@ -359,6 +448,19 @@ private fun FullMediaViewer(files: List<CameraPhoto>, initial: Int, state: AppSt
                 var loading by remember(file.key) { mutableStateOf(false) }
                 var videoPath by remember(file.key) { mutableStateOf<String?>(null) }
                 var error by remember(file.key) { mutableStateOf<String?>(null) }
+                var focus by remember(file.key) { mutableStateOf<FocusRegion?>(null) }
+                var focusStatus by remember(file.key) { mutableStateOf<String?>(null) }
+                LaunchedEffect(file.key, showFocus, index == pager.currentPage) {
+                    focus = null; focusStatus = null
+                    if (showFocus && file.kind.isPhoto && index == pager.currentPage) {
+                        focusStatus = "正在读取对焦信息…"
+                        try {
+                            focus = focusRegion(file)
+                            focusStatus = if (focus == null) "此照片无可用对焦坐标，或预览格式暂不支持" else null
+                        } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+                        catch (e: Exception) { focusStatus = e.message ?: "对焦信息读取失败" }
+                    }
+                }
                 var scale by remember(file.key) { mutableFloatStateOf(1f) }
                 var offset by remember(file.key) { mutableStateOf(Offset.Zero) }
                 LaunchedEffect(pager.currentPage) { if (index == pager.currentPage) currentScale = scale }
@@ -385,13 +487,24 @@ private fun FullMediaViewer(files: List<CameraPhoto>, initial: Int, state: AppSt
                         } }, modifier = Modifier.fillMaxSize())
                         DisposableEffect(path, index == pager.currentPage) { onDispose { player?.stopPlayback() } }
                     } else {
-                        bitmap?.let { image -> Image(image.asImageBitmap(), file.name,
-                            Modifier.fillMaxSize().transformable(transform, canPan = { scale > 1.01f })
+                        bitmap?.let { image ->
+                            Box(Modifier.fillMaxSize().transformable(transform, canPan = { scale > 1.01f })
                                 .pointerInput(file.key) { detectTapGestures(onDoubleTap = {
                                     scale = if (scale > 1f) 1f else 3f; offset = Offset.Zero; currentScale = scale
-                                }) }.graphicsLayer(scaleX = scale, scaleY = scale, translationX = offset.x, translationY = offset.y),
-                            contentScale = ContentScale.Fit) }
-                            ?: Text(if (file.kind.isVideo) "${file.kind.label} 视频" else "暂无可用预览", color = Color.White, fontSize = 24.sp)
+                                }) }.graphicsLayer(scaleX = scale, scaleY = scale, translationX = offset.x, translationY = offset.y)) {
+                                Image(image.asImageBitmap(), file.name, Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
+                                if (showFocus && focus != null && !loading) Canvas(Modifier.fillMaxSize().testTag("focus-overlay")) {
+                                    val fit = minOf(size.width / image.width, size.height / image.height)
+                                    val w = image.width * fit; val h = image.height * fit
+                                    val f = focus!!
+                                    drawRect(if (f.inFocus) Color.Green else Color.Red,
+                                        topLeft = Offset((size.width - w) / 2 + f.left * w, (size.height - h) / 2 + f.top * h),
+                                        size = Size((f.right - f.left) * w, (f.bottom - f.top) * h), style = Stroke(2.dp.toPx()))
+                                }
+                            }
+                        } ?: Text(if (file.kind.isVideo) "${file.kind.label} 视频" else "暂无可用预览", color = Color.White, fontSize = 24.sp)
+                        if (showFocus && file.kind.isPhoto && focusStatus != null) Text(focusStatus!!, color = Color.LightGray,
+                            fontSize = 11.sp, modifier = Modifier.align(Alignment.BottomCenter).padding(horizontal = 24.dp, vertical = 100.dp))
                         if (loading) CircularProgressIndicator(Modifier.size(36.dp), color = Lime)
                         if (file.kind.isVideo) Column(Modifier.align(Alignment.BottomCenter).padding(horizontal = 24.dp, vertical = 130.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                             if (file.kind == PhotoKind.NEV) Text("N-RAW 原文件可下载；播放使用同目录、同名 MP4 代理", color = Color.White, fontSize = 12.sp)
@@ -408,12 +521,19 @@ private fun FullMediaViewer(files: List<CameraPhoto>, initial: Int, state: AppSt
                 }
             }
             val file = files[pager.currentPage]
+            val deleteFailure = state.deletion.outcomes.lastOrNull { it.file.key == file.key && !it.deleted }
+            if (!state.deletion.running && deleteFailure != null) Text("删除未成功：${deleteFailure.error}",
+                color = Color(0xFFFFB8A8), fontSize = 12.sp,
+                modifier = Modifier.align(Alignment.BottomCenter).padding(start = 18.dp, end = 18.dp, bottom = 86.dp))
             Row(Modifier.align(Alignment.TopCenter).fillMaxWidth().safeDrawingPadding().background(Color.Black.copy(alpha = 0.55f)).padding(8.dp),
                 verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = onClose) { Text("返回", color = Color.White) }
                 Column(Modifier.weight(1f)) {
                     Text(file.name, color = Color.White, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text("${pager.currentPage + 1}/${files.size} · ${file.kind.label} · ${fileSize(file)}", color = Color.LightGray, fontSize = 11.sp)
+                }
+                if (file.kind.isPhoto) TextButton(onClick = { onShowFocus(!showFocus) }, modifier = Modifier.testTag("focus-toggle")) {
+                    Text(if (showFocus) "隐藏对焦框" else "显示对焦框", color = if (showFocus) Lime else Color.White, fontSize = 12.sp)
                 }
                 TextButton(onClick = { showInfo = !showInfo }) { Text("信息", color = Color.White) }
             }
@@ -427,6 +547,8 @@ private fun FullMediaViewer(files: List<CameraPhoto>, initial: Int, state: AppSt
                     colors = CheckboxDefaults.colors(uncheckedColor = Color.White), modifier = Modifier.semantics { contentDescription = "选择预览文件 ${file.name}" })
                 Text("选择此文件", color = Color.White, fontSize = 13.sp)
                 Spacer(Modifier.weight(1f))
+                TextButton(onClick = { onDeleteFile(file) }, enabled = state.connected && !state.busy && state.supportsDeletion,
+                    modifier = Modifier.testTag("delete-preview-file")) { Text("删除此文件", color = if (state.supportsDeletion) Color(0xFFFFB8A8) else Muted, fontSize = 12.sp) }
                 TextButton(onClick = { scope.launch { currentScale = 1f; pager.animateScrollToPage((pager.currentPage + 1).coerceAtMost(files.lastIndex)) } },
                     enabled = pager.currentPage < files.lastIndex) { Text("下一个", color = Color.White) }
             }
@@ -435,13 +557,20 @@ private fun FullMediaViewer(files: List<CameraPhoto>, initial: Int, state: AppSt
 }
 
 @Composable
-internal fun DeleteConfirmation(plan: DeletionPlan, enabled: Boolean, onClose: () -> Unit, onConfirm: () -> Unit) {
-    var acknowledged by remember(plan) { mutableStateOf(false) }
+internal fun DeleteConfirmation(plan: DeletionPlan, enabled: Boolean, onClose: () -> Unit, onConfirm: () -> Unit,
+    companions: List<CameraPhoto> = emptyList(), onConfirmFiles: ((List<CameraPhoto>) -> Unit)? = null) {
+    var includeJpeg by remember(plan) { mutableStateOf(false) }
+    val files = remember(plan, companions, includeJpeg) { (plan.files + if (includeJpeg) companions else emptyList()).distinctBy { it.key } }
+    var acknowledged by remember(plan, includeJpeg) { mutableStateOf(false) }
     AlertDialog(onDismissRequest = onClose, title = { Text("删除相机存储卡中的文件", color = Danger) }, text = {
         Column {
-            Text("将永久删除以下 ${plan.files.size} 个相机原文件。此操作不可撤销；手机上已有的下载副本会保留。", fontSize = 13.sp)
+            if (companions.isNotEmpty()) Row(Modifier.fillMaxWidth().clickable { includeJpeg = !includeJpeg }, verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(includeJpeg, { includeJpeg = it }, modifier = Modifier.semantics { contentDescription = "同时删除同名 JPEG" })
+                Text("同时删除同卡同目录的同名 JPEG（${companions.size} 个）", fontSize = 12.sp)
+            }
+            Text("将永久删除以下 ${files.size} 个相机原文件。此操作不可撤销；手机上已有的下载副本会保留。", fontSize = 13.sp)
             LazyColumn(Modifier.heightIn(max = 230.dp).padding(vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(plan.files, key = { it.key }) { file ->
+                items(files, key = { it.key }) { file ->
                     Column {
                         Text(file.name, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
                         Text("${file.storageLabel}/${file.folder} · ${fileSize(file)}", fontSize = 10.sp, color = Muted)
@@ -454,7 +583,7 @@ internal fun DeleteConfirmation(plan: DeletionPlan, enabled: Boolean, onClose: (
             }
             if (!enabled) Text("连接或任务状态已变化，请重新选择文件", color = Danger, fontSize = 11.sp)
         }
-    }, confirmButton = { TextButton(onClick = onConfirm, enabled = enabled && acknowledged) { Text("永久删除 ${plan.files.size} 个文件", color = if (enabled && acknowledged) Danger else Muted) } },
+    }, confirmButton = { TextButton(onClick = { onConfirmFiles?.invoke(files) ?: onConfirm() }, enabled = enabled && acknowledged) { Text("永久删除 ${files.size} 个文件", color = if (enabled && acknowledged) Danger else Muted) } },
         dismissButton = { TextButton(onClick = onClose) { Text("取消") } })
 }
 
@@ -493,7 +622,7 @@ internal fun DeleteConfirmation(plan: DeletionPlan, enabled: Boolean, onClose: (
 @Composable private fun SetupGuide(modifier: Modifier = Modifier) {
     LazyColumn(modifier.fillMaxWidth().padding(horizontal = 22.dp), contentPadding = PaddingValues(vertical = 24.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
         item { Text("连接 Z8，浏览照片与视频", fontSize = 22.sp, fontWeight = FontWeight.SemiBold) }
-        items(listOf("USB：用数据线连接 Z8 的 USB 数据接口，在相机选择 MTP/PTP，点击「连接相机」并允许访问。", "Wi-Fi：点右上角「Wi-Fi 连接」，按引导在手机设置中连接 Z8 热点，再回到 App 建立连接。", "点按文件全屏预览，勾选后下载原文件。相机文件删除目前通过 USB 连接提供。", "上滑收起工具栏，向下拉或点击「展开工具栏」恢复。支持 NEF、JPEG、HEIF、NEV、MOV、MP4 及其他相机文件。")) {
+        items(listOf("USB：用数据线连接 Z8 的 USB 数据接口，在相机选择 MTP/PTP，点击「连接相机」并允许访问。", "Wi-Fi：点右上角「Wi-Fi 连接」，按引导在手机设置中连接 Z8 热点，再回到 App 建立连接。", "点按文件全屏预览，勾选后下载原文件。USB 和 Wi-Fi 删除均按相机开放能力提供。", "上滑收起工具栏，向下拉或点击「展开工具栏」恢复。支持 NEF、JPEG、HEIF、NEV、MOV、MP4 及其他相机文件。")) {
             Text(it, fontSize = 14.sp, lineHeight = 23.sp, color = Muted)
         }
         item { Text("照片保存至 Pictures/Z8Transfer；普通视频至 Movies/Z8Transfer；NEV 与其他文件至 Download/Z8Transfer。视频传输大小受当前连接方式限制，手机播放优先使用 MP4 代理。", fontSize = 12.sp, color = Muted) }

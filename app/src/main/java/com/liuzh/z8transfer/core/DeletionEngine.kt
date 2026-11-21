@@ -23,7 +23,7 @@ data class DeletionProgress(
 class DeletionEngine {
     suspend fun run(source: CameraTransport, plan: DeletionPlan, shouldStop: () -> Boolean,
         update: (DeletionProgress) -> Unit): DeletionProgress {
-        check(source.supportsDeletion) { "相机未声明支持 USB 删除，请在相机上删除" }
+        check(source.supportsDeletion) { "相机当前连接未声明支持删除，请在相机上删除" }
         check(source.sessionId == plan.sessionId) { "相机已重新连接，请重新选择文件并确认删除" }
         val results = mutableListOf<DeletionOutcome>()
         for (file in plan.files) {

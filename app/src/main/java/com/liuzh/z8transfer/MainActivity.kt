@@ -139,6 +139,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() { super.onStart(); controller.setForeground(true) }
+    override fun onStop() { controller.setForeground(false); super.onStop() }
+
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); setIntent(intent); handleAttach(intent) }
     override fun onSaveInstanceState(outState: Bundle) { outState.putBoolean("retryAfterPermission", retryAfterPermission); super.onSaveInstanceState(outState) }
     override fun onDestroy() { unregisterReceiver(permissionReceiver); super.onDestroy() }

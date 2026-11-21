@@ -7,6 +7,23 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 class PtpProtocolTest {
+    @Test fun propertyDataOutHasMatchingTransactionAndNegativeResponseLeavesSessionUsable() {
+        val pipe = Packets(ArrayDeque(listOf(frame(3,0x201d,1),frame(3,0x2001,2))))
+        val p = PtpProtocol(pipe,sessionAlreadyOpen=true)
+        val payload = byteArrayOf(-77,-2)
+        assertEquals(0x201d,p.commandWithData(0x1016,intArrayOf(0x5010),payload).code)
+        assertTrue(p.usable)
+        p.command(0x90c8).requireOk()
+        assertArrayEquals(frame(1,0x1016,1,ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(0x5010).array()) +
+            frame(2,0x1016,1,payload) + frame(1,0x90c8,2),pipe.sent.toByteArray())
+    }
+    @Test fun mismatchedPropertyWriteResponseInvalidatesSessionWithoutRetry() {
+        val pipe = Packets(ArrayDeque(listOf(frame(3,0x2001,9))))
+        val p = PtpProtocol(pipe,sessionAlreadyOpen=true)
+        assertThrows(Exception::class.java) { p.commandWithData(0x1016,intArrayOf(0x500f),byteArrayOf(100,0)) }
+        assertFalse(p.usable); assertTrue(pipe.closed)
+        assertEquals(30,pipe.sent.size()) // One 16-byte command and one 14-byte data container.
+    }
     private fun frame(type: Int, code: Int, id: Int, body: ByteArray = byteArrayOf(), length: Long = 12L + body.size): ByteArray =
         ByteBuffer.allocate(12 + body.size).order(ByteOrder.LITTLE_ENDIAN).putInt(length.toInt()).putShort(type.toShort()).putShort(code.toShort()).putInt(id).put(body).array()
 

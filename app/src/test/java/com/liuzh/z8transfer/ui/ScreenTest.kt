@@ -31,7 +31,7 @@ class ScreenTest {
         "DCIM/100NZ_8", name, if (kind == PhotoKind.NEV) 6L * 1024 * 1024 * 1024 else 12_582_912L,
         1_793_930_400_000L, 1_793_930_400_000L, kind,
     )
-    private fun connected(files: List<CameraPhoto> = listOf(photo())) = AppState(storageReady = true, cameraName = "Nikon Z8", photos = files, supportsDeletion = true)
+    private fun connected(files: List<CameraPhoto> = listOf(photo())) = AppState(storageReady = true, cameraName = "Nikon Z8", page = CameraPage.PHOTOS, photosCurrent = true, photos = files, supportsDeletion = true)
 
     @Test fun disconnectedScreenGuidesConnectionWithoutDestructiveActions() {
         var connections = 0
@@ -200,6 +200,337 @@ class ScreenTest {
         compose.runOnIdle { state = connected().copy(connectionLabel = "USB · 系统 MTP") }
         compose.onNodeWithTag("usb-mode-selector").assertDoesNotExist()
         compose.onNodeWithText("● USB · 系统 MTP 已连接 · 照片与视频").assertIsDisplayed()
+    }
+
+    @Test fun rawAndJpegFiltersAndSortingAreIndependentOfSelection() {
+        val raw = photo(1, "B.NEF")
+        val jpeg = photo(2, "A.JPG", PhotoKind.JPEG)
+        var state by mutableStateOf(connected(listOf(raw, jpeg)).copy(selected = setOf(raw.key)))
+        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, {}, {}, {}, { null }) } }
+        compose.onAllNodesWithText("JPEG")[0].performClick()
+        compose.onNodeWithText("A.JPG").assertIsDisplayed()
+        compose.onNodeWithText("B.NEF").assertDoesNotExist()
+        compose.onNodeWithText("已选 1 个文件").assertIsDisplayed()
+        compose.onAllNodesWithText("RAW")[0].performClick()
+        compose.onNodeWithText("B.NEF").assertIsDisplayed()
+        compose.onNodeWithText("排序 ▾").performClick()
+        compose.onNodeWithText("文件名：升序").performClick()
+        compose.onNodeWithText("B.NEF").assertExists()
+    }
+
+    @Test fun sixColumnLayoutAndFastScrollCanReachEndOfLargeList() {
+        val files = (1..180).map { photo(it, "DSC_%04d.NEF".format(it)) }
+        compose.setContent { Z8Theme { TransferContent(connected(files), {}, {}, {}, {}, {}, {}, {}, {}, {}, { null }) } }
+        compose.onNodeWithText("2列 ▾").performClick()
+        compose.onNodeWithText("6列").performClick()
+        compose.onNodeWithText("6列 ▾").assertIsDisplayed()
+        snapshot("v040-six-columns")
+        compose.onNodeWithTag("page-handle").assertIsDisplayed().performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.SetProgress) { it(1f) }
+        compose.onNodeWithText("DSC_0180.NEF").assertExists()
+    }
+
+    @Test fun longPressDragSelectsRangeAndCanDeselectIt() {
+        val files = (1..6).map { photo(it, "DSC_%04d.NEF".format(it)) }
+        var state by mutableStateOf(connected(files))
+        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, {}, {}, {}, { null },
+            onSelectionChange = { state = state.copy(selected = it) }) } }
+        compose.onNodeWithText("全屏浏览").performClick()
+        fun drag() {
+            compose.onNodeWithTag("file-grid").performTouchInput {
+                down(androidx.compose.ui.geometry.Offset(width * .25f, 100f))
+            }
+            compose.mainClock.advanceTimeBy(750)
+            compose.onNodeWithTag("file-grid").performTouchInput {
+                moveTo(androidx.compose.ui.geometry.Offset(width * .7f, 120f), 100)
+                up()
+            }
+        }
+        drag()
+        compose.runOnIdle { assertEquals(setOf(files[0].key, files[1].key), state.selected) }
+        drag()
+        compose.runOnIdle { assertTrue(state.selected.isEmpty()) }
+        compose.onNodeWithTag("full-media-viewer").assertDoesNotExist()
+    }
+
+    @Test fun focusToggleShowsRealOverlayAndRemovesItWhenHidden() {
+        val bitmap = Bitmap.createBitmap(800, 600, Bitmap.Config.ARGB_8888)
+        compose.setContent { Z8Theme { TransferContent(connected(), {}, {}, {}, {}, {}, {}, {}, {}, {}, { bitmap },
+            focusRegion = { FocusRegion(.2f, .3f, .4f, .5f, true) }) } }
+        compose.onNodeWithText("DSC_0001.NEF").performClick()
+        compose.onNodeWithText("显示对焦框").performClick()
+        compose.onNodeWithTag("focus-overlay").assertExists()
+        snapshot("v040-focus-overlay")
+        compose.onNodeWithText("隐藏对焦框").performClick()
+        compose.onNodeWithTag("focus-overlay").assertDoesNotExist()
+    }
+
+    @Test fun optionalCompanionJpegAppearsInConfirmedListAndChangingItResetsAcknowledgement() {
+        val raw = photo(); val jpeg = photo(2, "DSC_0001.JPG", PhotoKind.JPEG)
+        var confirmed = emptyList<CameraPhoto>()
+        compose.setContent { Z8Theme { DeleteConfirmation(DeletionPlan(raw.sessionId, listOf(raw)), true, {}, onConfirm = {},
+            companions = listOf(jpeg), onConfirmFiles = { confirmed = it }) } }
+        compose.onNodeWithText("DSC_0001.JPG").assertDoesNotExist()
+        compose.onNodeWithContentDescription("确认永久删除相机原文件").performClick()
+        compose.onNodeWithContentDescription("同时删除同名 JPEG").performClick()
+        compose.onNodeWithText("DSC_0001.JPG").assertIsDisplayed()
+        compose.onNodeWithText("永久删除 2 个文件").assertIsNotEnabled()
+        compose.onNodeWithContentDescription("确认永久删除相机原文件").performClick()
+        snapshot("v040-paired-delete")
+        compose.onNodeWithText("永久删除 2 个文件").performClick()
+        assertEquals(listOf(raw, jpeg), confirmed)
+    }
+
+    @Test fun wirelessDeletionIsEnabledWhenCameraAdvertisesIt() {
+        val p = photo()
+        compose.setContent { Z8Theme { TransferContent(connected().copy(connectionLabel = "Wi-Fi", selected = setOf(p.key)),
+            {}, {}, {}, {}, {}, {}, {}, {}, {}, { null }) } }
+        compose.onNodeWithText("删除相机文件").assertIsEnabled().performClick()
+        compose.onNodeWithText("永久删除 1 个文件").assertIsNotEnabled()
+    }
+
+    @Test fun previewDeleteShowsConfirmationAndCanIncludeCompanionJpeg() {
+        val raw = photo(); val jpeg = photo(2, "DSC_0001.JPG", PhotoKind.JPEG)
+        val next = photo(3, "DSC_0002.JPG", PhotoKind.JPEG)
+        var state by mutableStateOf(connected(listOf(raw, jpeg, next)))
+        var removed = emptyList<CameraPhoto>()
+        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, {}, {}, {}, { null },
+            onDelete = { plan -> removed = plan.files; state = state.copy(photos = state.photos.filterNot { p -> p.key in plan.files.map { it.key } }) }) } }
+        compose.onNodeWithText("DSC_0001.NEF").performClick()
+        compose.onNodeWithText("删除此文件").assertIsEnabled().performClick()
+        compose.onNodeWithText("永久删除 1 个文件").assertIsNotEnabled()
+        assertTrue(removed.isEmpty())
+        compose.onNodeWithContentDescription("同时删除同名 JPEG").performClick()
+        compose.onNodeWithContentDescription("确认永久删除相机原文件").performClick()
+        snapshot("v050-preview-delete")
+        compose.onNodeWithText("永久删除 2 个文件").performClick()
+        assertEquals(listOf(raw,jpeg),removed)
+        compose.onNodeWithTag("full-media-viewer").assertIsDisplayed()
+        compose.onNode(hasText("DSC_0002.JPG") and hasAnyAncestor(hasTestTag("full-media-viewer"))).assertIsDisplayed()
+    }
+
+    @Test fun deletingLastPreviewClosesViewerAndUnsupportedDeletionIsDisabled() {
+        var state by mutableStateOf(connected().copy(supportsDeletion = false))
+        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, {}, {}, {}, { null },
+            onDelete = { state = state.copy(photos = emptyList()) }) } }
+        compose.onNodeWithText("DSC_0001.NEF").performClick()
+        compose.onNodeWithText("删除此文件").assertIsNotEnabled()
+        compose.runOnIdle { state = state.copy(supportsDeletion = true) }
+        compose.onNodeWithText("删除此文件").performClick()
+        compose.onNodeWithContentDescription("确认永久删除相机原文件").performClick()
+        compose.onNodeWithText("永久删除 1 个文件").performClick()
+        compose.onNodeWithTag("full-media-viewer").assertDoesNotExist()
+    }
+
+    @Test fun remoteEntryUsesIndependentPageAndMtpExplainsConnectionChoices() {
+        var state by mutableStateOf(connected().copy(remoteUnavailableReason = "系统 MTP 不提供遥控，请使用 Wi-Fi"))
+        var opened = 0
+        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, {}, {}, {}, { null },
+            onOpenRemote = { opened++ }, onPageChange = { state = state.copy(page = it) }) } }
+        compose.onNodeWithTag("open-remote").performClick()
+        compose.onNodeWithTag("file-grid").assertDoesNotExist()
+        compose.onNodeWithText("系统 MTP 不提供遥控，请使用 Wi-Fi").assertIsDisplayed()
+        compose.onNodeWithTag("start-remote").assertIsNotEnabled()
+        compose.runOnIdle { state = state.copy(remoteCapabilities = RemoteCapabilities(true,true,true)) }
+        compose.onNodeWithTag("start-remote").performClick()
+        assertEquals(1,opened)
+    }
+
+    @Test fun remoteDialogShowsLiveFrameAndSendsExplicitShutterAndFocusCommands() {
+        val bitmap = Bitmap.createBitmap(1280,720,Bitmap.Config.ARGB_8888)
+        var remote by mutableStateOf(com.liuzh.z8transfer.RemoteUiState(open = true,
+            status = RemoteStatus(live = true, message = "实时画面传输中"), frame = bitmap,
+            receivedAt = android.os.SystemClock.elapsedRealtime(), frameNumber = 25, fps = 6.5))
+        val actions = mutableListOf<RemoteAction>(); var closes = 0
+        compose.setContent { Z8Theme { RemoteCameraDialog(remote, RemoteCapabilities(true,true,true), { actions += it }, { closes++ }) } }
+        compose.onNodeWithContentDescription("相机实时取景").assertIsDisplayed()
+        compose.onNodeWithText("自动对焦").performClick()
+        compose.onNodeWithTag("remote-shutter").performClick()
+        assertEquals(listOf(RemoteAction.Focus,RemoteAction.Capture(true)),actions)
+        compose.onNodeWithText("暂停取景").performClick()
+        assertEquals(RemoteAction.Pause,actions.last())
+        snapshot("v050-camera-remote")
+        compose.runOnIdle { remote = remote.copy(status = remote.status.copy(busy = true)) }
+        compose.onNodeWithTag("remote-shutter").assertIsNotEnabled()
+        compose.runOnIdle { remote = remote.copy(status = remote.status.copy(busy = false,captureBlocked = true)) }
+        compose.onNodeWithTag("remote-shutter").assertIsNotEnabled()
+        compose.onNodeWithText("返回照片").performClick()
+        assertTrue(closes > 0)
+    }
+
+    @Test fun remoteViewStopsWhenActivityGoesToBackground() {
+        val closes = java.util.concurrent.atomic.AtomicInteger()
+        compose.setContent { Z8Theme { RemoteCameraDialog(com.liuzh.z8transfer.RemoteUiState(open = true),
+            RemoteCapabilities(true,true,true), {}, { closes.incrementAndGet() }) } }
+        compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.CREATED)
+        assertTrue(closes.get() > 0)
+    }
+    @Test fun remoteParametersLoadOnlyOnTapAndSelectionSendsExactCameraValue() {
+        val iso = ShootingParameter(ShootingSetting.ISO,DeviceProperty(0x500f,4,true,100,listOf(100,200,400)))
+        val parameters = listOf(
+            ShootingParameter(ShootingSetting.MODE,DeviceProperty(0x500e,4,true,1,listOf(1,2,3,4))),
+            ShootingParameter(ShootingSetting.SHUTTER,DeviceProperty(0xd100,6,true,0x100fa,listOf(0x100fa,0x101f4))),
+            ShootingParameter(ShootingSetting.APERTURE,DeviceProperty(0x5007,4,true,400,listOf(400,560))), iso,
+            ShootingParameter(ShootingSetting.EXPOSURE,DeviceProperty(0x5010,3,true,0,listOf(-333,0,333))),
+            ShootingParameter(ShootingSetting.WHITE_BALANCE,DeviceProperty(0x5005,4,true,2,listOf(2,4,0x8010))))
+        var remote by mutableStateOf(com.liuzh.z8transfer.RemoteUiState(open = true,status = RemoteStatus(live=true)))
+        val actions = mutableListOf<RemoteAction>()
+        compose.setContent { Z8Theme { RemoteCameraContent(remote,RemoteCapabilities(true,true,true,true), { action ->
+            actions += action
+            if (action == RemoteAction.ReadParameters) remote = remote.copy(status = remote.status.copy(parameters=parameters,parametersLoaded=true))
+        }, {}) } }
+        compose.onNodeWithTag("remote-shutter").assertIsDisplayed().assertIsEnabled()
+        assertTrue(actions.isEmpty())
+        compose.onNodeWithTag("remote-parameters").performClick()
+        assertEquals(listOf(RemoteAction.ReadParameters),actions)
+        compose.onNodeWithTag("parameter-MODE").assertIsDisplayed()
+        compose.onNodeWithTag("parameter-EXPOSURE").assertIsDisplayed()
+        compose.onNodeWithTag("shooting-parameters-panel").assertIsDisplayed()
+        val frame = compose.onNodeWithTag("live-view-frame").fetchSemanticsNode().boundsInRoot
+        assertTrue("Parameter panel must leave room for the live image",frame.height > frame.width * .35f)
+        compose.onNodeWithTag("remote-shutter").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithTag("parameter-ISO").performScrollTo().performClick()
+        compose.onNodeWithTag("parameter-value-200").performScrollTo().performClick()
+        assertEquals(RemoteAction.SetParameter(ShootingSetting.ISO,200),actions.last())
+        // No optimistic value is displayed before a camera readback.
+        compose.onNodeWithTag("parameter-ISO").assertTextContains("100",substring=true)
+        compose.runOnIdle { remote = remote.copy(status = remote.status.copy(parameters=parameters.map {
+            if (it.setting == ShootingSetting.ISO) iso.copy(property=iso.property!!.copy(current=200)) else it })) }
+        compose.onNodeWithTag("parameter-ISO").assertTextContains("200",substring=true)
+        snapshot("v080-remote-parameters")
+        compose.onNodeWithText("返回取景").performClick()
+        compose.onNodeWithTag("remote-shutter").assertIsDisplayed().assertIsEnabled()
+    }
+    @Test fun readOnlyParameterExplainsModeRestrictionAndCannotOpenChoices() {
+        val aperture = ShootingParameter(ShootingSetting.APERTURE,DeviceProperty(0x5007,4,false,400,listOf(400,560)))
+        var remote by mutableStateOf(com.liuzh.z8transfer.RemoteUiState(open=true,
+            status=RemoteStatus(parameters=listOf(aperture),parametersLoaded=true)))
+        compose.setContent { Z8Theme { RemoteCameraContent(remote,RemoteCapabilities(true,true,true,true),{}, {}) } }
+        compose.onNodeWithTag("remote-parameters").performClick()
+        compose.onNodeWithTag("parameter-APERTURE").assertIsNotEnabled()
+        compose.onNodeWithText("相机设为只读",substring=true).assertIsDisplayed()
+        compose.onNodeWithTag("parameter-value-400").assertDoesNotExist()
+        compose.runOnIdle { remote=remote.copy(pending=true) }
+        compose.onNodeWithText("刷新").assertIsNotEnabled()
+    }
+    @Test fun unavailableParameterConnectionAndReadFailureLeaveExplicitRecovery() {
+        var caps by mutableStateOf(RemoteCapabilities(true,true,true))
+        var remote by mutableStateOf(com.liuzh.z8transfer.RemoteUiState(open=true))
+        compose.setContent { Z8Theme { RemoteCameraContent(remote,caps,{}, {}) } }
+        compose.onNodeWithTag("remote-parameters").assertIsNotEnabled()
+        compose.runOnIdle { caps=caps.copy(parameters=true); remote=remote.copy(status=RemoteStatus(error="相机忙")) }
+        compose.onNodeWithTag("remote-parameters").performClick()
+        compose.onNodeWithText("读取未完成，请点刷新重试").assertIsDisplayed()
+        compose.onNodeWithText("刷新").assertIsEnabled()
+        compose.onNodeWithText("返回取景").performClick()
+        compose.onNodeWithTag("remote-shutter").assertIsEnabled()
+    }
+    @Test fun modePickerAndGroupTabsUseCameraValuesWithoutHidingShutter() {
+        val mode = ShootingParameter(ShootingSetting.MODE,DeviceProperty(0x500e,4,true,1,listOf(1,2,3,4)))
+        var remote by mutableStateOf(com.liuzh.z8transfer.RemoteUiState(open=true,status=RemoteStatus()))
+        val actions = mutableListOf<RemoteAction>()
+        compose.setContent { Z8Theme { RemoteCameraContent(remote,RemoteCapabilities(true,true,true,true),{ action ->
+            actions += action
+            if (action == RemoteAction.ReadParameters) remote=remote.copy(status=remote.status.copy(parameters=listOf(mode),parametersLoaded=true))
+            if (action is RemoteAction.ReadParameterGroup) remote=remote.copy(status=remote.status.copy(parameterGroup=action.group,parameters=emptyList(),parametersLoaded=true))
+        },{}) } }
+        compose.onNodeWithTag("remote-parameters").performClick()
+        compose.onNodeWithTag("parameter-MODE").performClick()
+        compose.onNodeWithText("M · 手动").assertIsDisplayed()
+        compose.onNodeWithTag("parameter-value-3").performScrollTo().performClick()
+        assertEquals(RemoteAction.SetParameter(ShootingSetting.MODE,3),actions.last())
+        compose.onNodeWithTag("remote-shutter").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithTag("parameter-group-VIDEO").performScrollTo().performClick()
+        assertEquals(RemoteAction.ReadParameterGroup(ShootingGroup.VIDEO),actions.last())
+        compose.onNodeWithTag("remote-shutter").assertIsNotEnabled()
+        compose.onNodeWithText("视频设置需先",substring=true).assertIsDisplayed()
+        compose.onNodeWithTag("parameter-group-COMMON").performScrollTo().performClick()
+        compose.onNodeWithTag("remote-shutter").assertIsEnabled()
+    }
+    @Test fun rangeEditorRejectsOutOfRangeInputAndAppliesExactKelvin() {
+        val kelvin = ShootingParameter(ShootingSetting.COLOR_TEMPERATURE,DeviceProperty(0xd01e,4,true,6500,emptyList(),PropertyRange(2500,10000,1)))
+        var remote by mutableStateOf(com.liuzh.z8transfer.RemoteUiState(open=true,status=RemoteStatus()))
+        val actions = mutableListOf<RemoteAction>()
+        compose.setContent { Z8Theme { RemoteCameraContent(remote,RemoteCapabilities(true,true,true,true),{ action ->
+            actions += action
+            if (action is RemoteAction.ReadParameterGroup) remote=remote.copy(status=remote.status.copy(parameterGroup=action.group,parameters=listOf(kelvin),parametersLoaded=true))
+        },{}) } }
+        compose.onNodeWithTag("remote-parameters").performClick()
+        compose.onNodeWithTag("parameter-group-COLOR").performScrollTo().performClick()
+        compose.onNodeWithTag("parameter-COLOR_TEMPERATURE").performClick()
+        compose.onNodeWithTag("parameter-range-input").performTextReplacement("10001")
+        compose.onNodeWithTag("parameter-range-apply").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithTag("parameter-range-input").performScrollTo().performTextReplacement("7601")
+        compose.onNodeWithTag("parameter-range-apply").performScrollTo().assertIsEnabled().performClick()
+        assertEquals(RemoteAction.SetParameter(ShootingSetting.COLOR_TEMPERATURE,7601),actions.last())
+    }
+    @Test fun stringSizePickerAndCoverageReportRemainReviewable() {
+        val size = ShootingParameter(ShootingSetting.IMAGE_SIZE,DeviceProperty(0x5003,0xffff,true,0,emptyList(),currentText="8256x5504",textChoices=listOf("8256x5504","6192x4128")))
+        var remote by mutableStateOf(com.liuzh.z8transfer.RemoteUiState(open=true,status=RemoteStatus()))
+        val actions = mutableListOf<RemoteAction>()
+        compose.setContent { Z8Theme { RemoteCameraContent(remote,RemoteCapabilities(true,true,true,true),{ action ->
+            actions += action
+            if (action is RemoteAction.ReadParameterGroup) remote=remote.copy(status=remote.status.copy(parameterGroup=action.group,
+                parameters=listOf(size),parametersLoaded=true,parameterCoverage="本版接入 65 项设置/状态。\n属性编号：0x5003"))
+        },{}) } }
+        compose.onNodeWithTag("remote-parameters").performClick()
+        compose.onNodeWithTag("parameter-group-QUALITY").performScrollTo().performClick()
+        compose.onNodeWithTag("parameter-IMAGE_SIZE").performClick()
+        compose.onNodeWithTag("parameter-text-6192x4128").performClick()
+        assertEquals(RemoteAction.SetTextParameter(ShootingSetting.IMAGE_SIZE,"6192x4128"),actions.last())
+        compose.onNodeWithText("能力").performClick()
+        compose.onNodeWithText("本版接入 65 项设置/状态。",substring=true).assertIsDisplayed()
+        compose.onNodeWithText("复制完整报告").performClick()
+        val clipboard = compose.activity.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        assertTrue(clipboard.primaryClip!!.getItemAt(0).text.toString().contains("0x5003"))
+    }
+
+    @Test fun deletingSwipedPreviewTargetsCurrentFileRatherThanInitialFile() {
+        val first = photo(1,"A.JPG",PhotoKind.JPEG); val second = photo(2,"B.JPG",PhotoKind.JPEG)
+        var removed = emptyList<CameraPhoto>()
+        compose.setContent { Z8Theme { TransferContent(connected(listOf(first,second)), {}, {}, {}, {}, {}, {}, {}, {}, {}, { null },
+            onDelete = { removed = it.files }) } }
+        compose.onNodeWithText("A.JPG").performClick()
+        compose.onNodeWithText("下一个").performClick()
+        compose.onNodeWithText("删除此文件").performClick()
+        compose.onNodeWithContentDescription("确认永久删除相机原文件").performClick()
+        compose.onNodeWithText("永久删除 1 个文件").performClick()
+        assertEquals(listOf(second),removed)
+    }
+
+    @Test fun scanningGalleryStillAllowsSwitchingToRemotePage() {
+        var state by mutableStateOf(connected().copy(scanning = true, photosCurrent = false))
+        var target: CameraPage? = null
+        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, {}, {}, {}, { null },
+            onPageChange = { target = it; state = state.copy(page = it, scanning = false) }) } }
+        compose.onNodeWithTag("open-remote").assertIsEnabled().performClick()
+        assertEquals(CameraPage.REMOTE,target)
+        compose.onNodeWithTag("file-grid").assertDoesNotExist()
+        compose.onNodeWithText("搜索文件名").assertDoesNotExist()
+    }
+
+    @Test fun connectedHomeHasNoGalleryAndDownloadsRequiresExplicitPageSelection() {
+        var state by mutableStateOf(connected().copy(page = CameraPage.HOME))
+        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, {}, {}, {}, { null },
+            onPageChange = { state = state.copy(page = it) }) } }
+        compose.onNodeWithTag("file-grid").assertDoesNotExist()
+        compose.onNodeWithText("相机已连接，选择功能").assertIsDisplayed()
+        snapshot("v060-home")
+        compose.onNodeWithTag("open-photos").performClick()
+        compose.onNodeWithTag("file-grid").assertExists()
+    }
+
+    @Test fun remoteIsAFullPageWithDirectDownloadsNavigation() {
+        val state = connected().copy(page = CameraPage.REMOTE, remoteCapabilities = RemoteCapabilities(true,true,true),
+            remote = com.liuzh.z8transfer.RemoteUiState(open = true))
+        var target: CameraPage? = null
+        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, {}, {}, {}, { null },
+            onPageChange = { target = it }) } }
+        compose.onNodeWithTag("remote-camera").assertIsDisplayed()
+        compose.onNodeWithTag("file-grid").assertDoesNotExist()
+        compose.onNodeWithTag("browser-tools").assertDoesNotExist()
+        snapshot("v060-remote-page")
+        compose.onNodeWithText("下载照片").performClick()
+        assertEquals(CameraPage.PHOTOS,target)
     }
 
     private fun snapshot(name: String) {

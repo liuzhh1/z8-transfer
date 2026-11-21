@@ -24,18 +24,26 @@ class WifiPtpTransport private constructor(
     private val identity: String,
     private val operations: Set<Int>,
     override val diagnostics: String,
+    private val properties: Set<Int> = emptySet(),
 ) : CameraTransport {
     override val sessionId: String = UUID.randomUUID().toString()
     override val connectionLabel: String = "Wi-Fi"
     private val live = AtomicBoolean(true)
     private val gate = Mutex()
     override val attached: Boolean get() = live.get() && protocol.usable && route.available
-    // This first wireless build deliberately exposes no destructive Wi-Fi operation.
-    // USB retains its checked DeleteObject implementation.
-    override val deletionUnavailableReason: String = "Wi-Fi 测试版支持浏览与下载；删除相机文件请使用 USB 连接"
+    override val supportsDeletion: Boolean get() = 0x100b in operations
+    override val deletionUnavailableReason: String = "相机当前 Wi-Fi 模式未开放删除，请切换连接方式或在相机中删除"
     var onDisconnected: (() -> Unit)?
         get() = protocol.onDisconnected
         set(value) { protocol.onDisconnected = value }
+
+    override val remoteUnavailableReason: String = "当前 Wi-Fi 会话未开放遥控指令。请检查相机照片模式，退出占用相机的 App 后重新连接；也可尝试标准 USB PTP"
+    override val remoteControl: RemoteCamera? = if (displayName.contains("Nikon", ignoreCase = true))
+        NikonRemoteCamera(operations, properties, { op, args, data -> withContext(Dispatchers.IO) {
+            gate.withLock { checkLive(); protocol.commandWithData(op, args, data) }
+        } }) { op, args -> withContext(Dispatchers.IO) {
+            gate.withLock { checkLive(); protocol.command(op, args) }
+        } } else null
 
     override suspend fun scan(onBatch: (List<CameraPhoto>) -> Unit, onExamined: (Int) -> Unit) = withContext(Dispatchers.IO) {
         gate.withLock {
@@ -127,6 +135,27 @@ class WifiPtpTransport private constructor(
         }
     }
 
+    override suspend fun deleteOriginal(photo: CameraPhoto) = withContext(Dispatchers.IO) {
+        gate.withLock {
+            checkPhoto(photo)
+            check(supportsDeletion) { deletionUnavailableReason }
+            val card = PtpData(protocol.command(0x1005, intArrayOf(photo.storageId)).requireOk().data)
+            card.u16(); card.u16(); card.u16()
+            val capacity = card.u64(); card.u64(); card.u32(); card.string()
+            val volume = card.string().ifBlank { "session:$sessionId" }
+            check(photo.storageIdentity == "$volume:$capacity") { "存储卡已变化，未执行删除；请刷新列表" }
+            val info = objectInfo(photo.handle)
+            check(info.matches(photo)) { "文件已变化或句柄已复用，未执行删除；请刷新列表" }
+            check(info.protection == 0) { "文件受到相机保护，请先在相机中解除保护" }
+            if (photo.size > 0 && info.rawSize == 0xffffffffL) {
+                check(objectSize(photo.handle, info.rawSize) == photo.size) { "文件大小已变化，未执行删除" }
+            }
+            checkLive()
+            protocol.command(0x100b, intArrayOf(photo.handle, 0)).requireOk()
+            Unit
+        }
+    }
+
     private fun checkLive() { check(attached) { "相机 Wi-Fi 已断开，请重新连接" } }
     private fun checkPhoto(photo: CameraPhoto) {
         checkLive()
@@ -134,6 +163,7 @@ class WifiPtpTransport private constructor(
     }
     override fun markDetached() { live.set(false); protocol.close(); route.close() }
     override suspend fun close() = withContext(Dispatchers.IO) {
+        if (attached) runCatching { remoteControl?.close() }
         live.set(false)
         protocol.onDisconnected = null
         route.onLost = null
@@ -163,7 +193,8 @@ class WifiPtpTransport private constructor(
                 opened.command(0x1002, intArrayOf(1)).requireOk()
                 val p = PtpData(opened.command(0x1001).requireOk().data)
                 p.u16(); p.u32(); p.u16(); p.string(); p.u16()
-                val operations = p.array16(); repeat(4) { p.array16() }
+                val operations = p.array16(); p.array16()
+                val properties = p.array16(); repeat(2) { p.array16() }
                 val manufacturer = p.string(); val model = p.string(); val version = p.string(); val serial = p.string()
                 check(setOf(0x1004, 0x1005, 0x1007, 0x1008, 0x1009).all(operations::contains)) {
                     "相机当前无线模式未开放文件浏览。请使用「连接至智能设备 → Wi-Fi 连接（AP 模式）」，退出 SnapBridge 后重试。电脑连接/PIN 配对模式暂不支持"
@@ -171,10 +202,10 @@ class WifiPtpTransport private constructor(
                 val name = "$manufacturer $model".trim().ifBlank { opened.cameraName.ifBlank { "Nikon Z8" } }
                 val cameraGuid = opened.cameraGuid.joinToString("") { "%02x".format(it.toInt() and 0xff) }
                 val identity = stableHash("$manufacturer:$model:${serial.ifBlank { "ptpip:$cameraGuid" }}")
-                val diagnostic = "设备：$name\n设备版本：$version\n连接：Wi-Fi PTP/IP · 64 位流式传输\n地址：${route.endpoint.host}:${route.endpoint.port}\n路由：独立绑定 Wi-Fi，不经过蜂窝数据\n无线删除：测试版暂未开放\n手机：${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE}"
+                val diagnostic = "设备：$name\n设备版本：$version\n连接：Wi-Fi PTP/IP · 64 位流式传输\n地址：${route.endpoint.host}:${route.endpoint.port}\n路由：独立绑定 Wi-Fi，不经过蜂窝数据\n无线删除：${if (0x100b in operations) "相机已声明支持" else "相机未开放"}\n手机：${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE}"
                 check(opened.usable && route.available) { "相机 Wi-Fi 已断开" }
                 prefs.edit { putString("last-host", endpoint.host); putInt("last-port", endpoint.port) }
-                WifiPtpTransport(route, opened, name, identity, operations, diagnostic)
+                WifiPtpTransport(route, opened, name, identity, operations, diagnostic, properties)
             } catch (error: Exception) {
                 protocol?.close(); route.close()
                 if (error is SocketTimeoutException) throw IOException("Wi-Fi 连接超时。请保持连接 Z8 热点、退出其他相机 App，并检查相机地址", error)
