@@ -1,6 +1,7 @@
 package com.liuzh.z8transfer
 
 import android.content.Context
+import androidx.core.content.edit
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
@@ -30,6 +31,9 @@ import com.liuzh.z8transfer.core.OutcomeStatus
 import com.liuzh.z8transfer.core.TransferEngine
 import com.liuzh.z8transfer.core.TransferProgress
 import com.liuzh.z8transfer.storage.MediaImportStore
+import com.liuzh.z8transfer.storage.PhotoMarkStore
+import com.liuzh.z8transfer.core.RawJpegMode
+import com.liuzh.z8transfer.core.planDownload
 import com.liuzh.z8transfer.usb.UsbMtpTransport
 import com.liuzh.z8transfer.usb.UsbPtpTransport
 import com.liuzh.z8transfer.usb.describeUsbConnection
@@ -67,6 +71,8 @@ data class AppState(
     val photos: List<CameraPhoto> = emptyList(),
     val selected: Set<String> = emptySet(),
     val downloaded: Set<String> = emptySet(),
+    val marked: Set<String> = emptySet(),
+    val rawJpegMode: RawJpegMode = RawJpegMode.SELECTED,
     val progress: TransferProgress = TransferProgress(),
     val error: String? = null,
     val deletion: DeletionProgress = DeletionProgress(),
@@ -89,6 +95,8 @@ class AppController(context: Context) {
     val state = mutableState.asStateFlow()
     private val manager = app.getSystemService(UsbManager::class.java)
     private val store = MediaImportStore(app)
+    private val markStore = PhotoMarkStore(app)
+    private val preferences = app.getSharedPreferences("download-preferences", Context.MODE_PRIVATE)
     private val engine = TransferEngine(store)
     @Volatile private var transport: CameraTransport? = null
     private var scanJob: Job? = null
@@ -109,6 +117,9 @@ class AppController(context: Context) {
     }
 
     init {
+        mutableState.update { it.copy(marked = markStore.read(), rawJpegMode = runCatching {
+            RawJpegMode.valueOf(preferences.getString("raw-jpeg-mode", RawJpegMode.SELECTED.name).orEmpty())
+        }.getOrDefault(RawJpegMode.SELECTED)) }
         scope.launch {
             runCatching { store.cleanupIncomplete() }.onFailure {
                 showError("未完成副本清理失败：${it.message}。请关闭 App 后重试")
@@ -392,13 +403,33 @@ class AppController(context: Context) {
 
     fun clearSelection() { if (!state.value.busy) mutableState.update { it.copy(selected = emptySet()) } }
 
+    fun setRawJpegMode(mode: RawJpegMode) {
+        if (state.value.busy) return
+        preferences.edit { putString("raw-jpeg-mode", mode.name) }
+        mutableState.update { it.copy(rawJpegMode = mode) }
+    }
+
+    fun markSelected() {
+        val current = state.value
+        if (current.busy) return
+        val fingerprints = current.photos.filter { it.key in current.selected }.map { it.importKey }.toSet()
+        if (fingerprints.isEmpty()) return
+        val next = if (current.marked.containsAll(fingerprints)) current.marked - fingerprints else current.marked + fingerprints
+        if (next.size > 20_000) { showError("已达到 20000 个标记，请先取消部分标记"); return }
+        markStore.write(next)
+        mutableState.update { it.copy(marked = next) }
+    }
+
     /** Called from the visible activity before starting the foreground service. */
     fun queueDownload(retryFailures: Boolean = false): Boolean {
         if (state.value.busy || !state.value.storageReady || transport?.attached != true) return false
         val failures = state.value.progress.outcomes.filter { it.status == OutcomeStatus.FAILED }.map { it.photo.importKey }.toSet()
         queued = if (retryFailures) state.value.photos.filter { it.importKey in failures }
-            else state.value.photos.filter { it.key in state.value.selected }
-        if (queued.isEmpty()) return false
+            else planDownload(state.value.photos.filter { it.key in state.value.selected }, state.value.photos, state.value.rawJpegMode).files
+        if (queued.isEmpty()) {
+            if (!retryFailures && state.value.selected.isNotEmpty()) showError("没有符合下载策略的文件，请检查同卡同目录是否存在配对 RAW/JPEG")
+            return false
+        }
         stop.set(false)
         mutableState.update { it.copy(progress = TransferProgress(running = true, totalFiles = queued.size), error = null) }
         return true

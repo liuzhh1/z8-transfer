@@ -186,4 +186,23 @@ class CameraNavigationTest {
         assertEquals(1,source.starts.get()); assertEquals(0,source.scans.get())
     }
 
+    @Test fun pairDownloadExpandsQueueWhileMarksAndDeleteSelectionStayIndependent() = runBlocking {
+        val jpeg = Source.photo(1)
+        val raw = jpeg.copy(handle = 2, name = jpeg.name.substringBeforeLast('.') + ".NEF", kind = PhotoKind.RAW)
+        source.files = listOf(raw, jpeg)
+        connect(); await { it.connected && it.storageReady }
+        controller.selectPage(CameraPage.PHOTOS); await { it.photosCurrent }
+        controller.toggle(raw)
+        controller.markSelected()
+        assertTrue(raw.importKey in controller.state.value.marked)
+        controller.setRawJpegMode(RawJpegMode.PAIR)
+        assertTrue(controller.queueDownload())
+        val queued = controller.javaClass.getDeclaredField("queued").apply { isAccessible = true }.get(controller) as List<*>
+        assertEquals(setOf(raw, jpeg), queued.toSet())
+        assertEquals(setOf(raw.key), controller.state.value.selected)
+        controller.failToStart("test stop")
+        controller.markSelected()
+        assertFalse(raw.importKey in controller.state.value.marked)
+    }
+
 }

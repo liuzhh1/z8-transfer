@@ -533,6 +533,57 @@ class ScreenTest {
         assertEquals(CameraPage.PHOTOS,target)
     }
 
+    @Test fun markedFilterUsesSavedFingerprintsAndSelectionCanToggleMarks() {
+        val raw = photo()
+        val jpeg = photo(2, "DSC_0002.JPG", PhotoKind.JPEG)
+        var state by mutableStateOf(connected(listOf(raw, jpeg)).copy(selected = setOf(raw.key)))
+        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, {}, {}, {}, { null },
+            onMarkSelected = { state = state.copy(marked = setOf(raw.importKey)) }) } }
+        compose.onNodeWithTag("mark-selected").performClick()
+        compose.onNodeWithContentDescription("已标记 DSC_0001.NEF").assertExists()
+        compose.onNodeWithText("已标记", substring = false).performClick()
+        compose.onNodeWithText("DSC_0001.NEF").assertExists()
+        compose.onNodeWithText("DSC_0002.JPG").assertDoesNotExist()
+        snapshot("v090-marked-photos")
+    }
+
+    @Test fun rawJpegStrategyShowsActualDownloadCountWithoutChangingDeleteSelection() {
+        val raw = photo()
+        val jpeg = photo(2, "DSC_0001.JPG", PhotoKind.JPEG)
+        var state by mutableStateOf(connected(listOf(raw, jpeg)).copy(selected = setOf(raw.key)))
+        var downloads = 0
+        compose.setContent { Z8Theme { TransferContent(state, {}, {}, {}, {}, {}, {}, { downloads++ }, {}, {}, { null },
+            onRawJpegModeChange = { state = state.copy(rawJpegMode = it) }) } }
+        compose.onNodeWithText("仅所选文件", substring = true).performClick()
+        compose.onNodeWithText("RAW＋JPEG 成对").performClick()
+        compose.onNodeWithText("已选 1 个文件").assertExists()
+        compose.onNodeWithText("下载 2 个原文件").performClick()
+        assertEquals(1, downloads)
+        assertEquals(setOf(raw.key), state.selected)
+        snapshot("v090-paired-download")
+    }
+
+    @Test fun monitoringOverlaysAndFullscreenKeepPreviewAndShutterAvailable() {
+        val bitmap = Bitmap.createBitmap(320, 180, Bitmap.Config.ARGB_8888).apply { eraseColor(android.graphics.Color.WHITE) }
+        compose.setContent { Z8Theme { RemoteCameraContent(com.liuzh.z8transfer.RemoteUiState(open = true, frame = bitmap),
+            RemoteCapabilities(true, true, true, true), {}, {}) } }
+        val before = compose.onNodeWithTag("live-view-frame").fetchSemanticsNode().boundsInRoot.height
+        compose.onNodeWithTag("monitor-toggle-grid").performClick()
+        compose.onNodeWithTag("monitor-grid").assertExists()
+        compose.onNodeWithTag("monitor-toggle-zebra").performClick()
+        compose.onNodeWithTag("monitor-toggle-histogram").performClick()
+        compose.waitUntil(5000) { compose.onAllNodesWithTag("monitor-histogram").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("monitor-overlay").assertExists()
+        compose.onNodeWithContentDescription("相机实时取景").assertIsDisplayed()
+        compose.onNodeWithTag("monitor-fullscreen").performClick()
+        val after = compose.onNodeWithTag("live-view-frame").fetchSemanticsNode().boundsInRoot.height
+        assertTrue(after > before)
+        compose.onNodeWithTag("remote-shutter").assertIsDisplayed()
+        snapshot("v090-monitor-fullscreen")
+        compose.onNodeWithText("恢复控件").performClick()
+        compose.onNodeWithTag("remote-parameters").assertExists()
+    }
+
     private fun snapshot(name: String) {
         val directory = System.getProperty("z8.screenshotDir") ?: return
         val file = File(directory, "$name.png").apply { parentFile?.mkdirs() }

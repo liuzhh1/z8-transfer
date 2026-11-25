@@ -60,6 +60,12 @@ internal fun RemoteCameraContent(state: RemoteUiState, capabilities: RemoteCapab
     onBrowsePhotos: (() -> Unit)? = null, onStop: () -> Unit = onClose) {
     var autofocus by rememberSaveable { mutableStateOf(capabilities.autofocus) }
     var showParameters by rememberSaveable { mutableStateOf(false) }
+    var histogram by rememberSaveable { mutableStateOf(false) }
+    var zebra by rememberSaveable { mutableStateOf(false) }
+    var peaking by rememberSaveable { mutableStateOf(false) }
+    var grid by rememberSaveable { mutableStateOf(false) }
+    var fullscreen by rememberSaveable { mutableStateOf(false) }
+    BackHandler(enabled = fullscreen) { fullscreen = false }
     BackHandler(enabled = showParameters) { showParameters = false }
     val owner = LocalLifecycleOwner.current
     val close by rememberUpdatedState(onStop)
@@ -79,7 +85,9 @@ internal fun RemoteCameraContent(state: RemoteUiState, capabilities: RemoteCapab
         while (state.status.live) { now = SystemClock.elapsedRealtime(); delay(500) }
     }
     BoxWithConstraints(Modifier.fillMaxSize().background(Color(0xFF111A17)).safeDrawingPadding()) {
-        val parameterHeight = (maxHeight * .4f).coerceAtMost(350.dp)
+        val compact = maxHeight < 500.dp
+        val parameterHeight = (maxHeight * (if (compact) .3f else .4f)).coerceAtMost(350.dp)
+        val controlsHeight = if (compact) 120.dp else 300.dp
         Column(Modifier.fillMaxSize().background(Color(0xFF111A17)).testTag("remote-camera")) {
             Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text("相机遥控", color = Color.White, fontSize = 19.sp, modifier = Modifier.weight(1f))
@@ -91,8 +99,12 @@ internal fun RemoteCameraContent(state: RemoteUiState, capabilities: RemoteCapab
                 }
             }
             Box(Modifier.weight(1f).fillMaxWidth().background(Color.Black).testTag("live-view-frame"), contentAlignment = Alignment.Center) {
-                state.frame?.let { Image(it.asImageBitmap(), "相机实时取景", Modifier.fillMaxSize(), contentScale = ContentScale.Fit) }
-                    ?: Text(if (capabilities.liveView) "等待相机实时画面…" else "当前连接不提供实时取景", color = Color.LightGray)
+                LiveViewMonitor(state.frame, histogram, zebra, peaking, grid, Modifier.fillMaxSize())
+                if (state.frame == null) Text(if (capabilities.liveView) "等待相机实时画面…" else "当前连接不提供实时取景", color = Color.LightGray)
+                TextButton(onClick = { fullscreen = !fullscreen; showParameters = false },
+                    modifier = Modifier.align(Alignment.TopEnd).background(Color.Black.copy(alpha = .65f)).testTag("monitor-fullscreen")) {
+                    Text(if (fullscreen) "恢复控件" else "全屏监看", color = Color.White, fontSize = 11.sp)
+                }
                 if (state.frame != null && (!state.status.live || now - state.receivedAt >= 2500)) Text(
                     if (state.status.live) "画面暂未更新" else "取景已暂停 · 保留最后一帧",
                     color = Color.White, fontSize = 12.sp,
@@ -100,10 +112,17 @@ internal fun RemoteCameraContent(state: RemoteUiState, capabilities: RemoteCapab
                 if (state.closing) Text("正在结束相机控制…", color = Color.White,
                     modifier = Modifier.background(Color.Black.copy(alpha = .8f)).padding(18.dp))
             }
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                MonitorChip("直方图", histogram, "monitor-toggle-histogram") { histogram = !histogram }
+                MonitorChip("斑马纹", zebra, "monitor-toggle-zebra") { zebra = !zebra }
+                MonitorChip("峰值对焦", peaking, "monitor-toggle-peaking") { peaking = !peaking }
+                MonitorChip("构图网格", grid, "monitor-toggle-grid") { grid = !grid }
+            }
             if (showParameters) ShootingParametersPanel(state, onAction,
                 Modifier.heightIn(max = parameterHeight)) { showParameters = false }
-            Column(Modifier.fillMaxWidth().heightIn(max = 300.dp).padding(14.dp)) {
-                if (!showParameters) Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
+            Column(Modifier.fillMaxWidth().heightIn(max = controlsHeight).padding(14.dp)) {
+                if (!showParameters && !fullscreen) Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
                     Text(state.status.message.ifBlank { "正在建立遥控…" }, color = Color.White, fontSize = 12.sp)
                     state.status.error?.let { Text(it, color = Color(0xFFFFB8A8), fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp)) }
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -137,11 +156,18 @@ internal fun RemoteCameraContent(state: RemoteUiState, capabilities: RemoteCapab
                     modifier = Modifier.fillMaxWidth().testTag("remote-shutter")) {
                     Text(if (state.busy) "相机处理中…" else "拍照", fontSize = 17.sp)
                 }
-                Text("请将相机切到照片模式。原片保存到相机存储卡，进入「下载照片」页后再读取列表，可选择下载。画面是实时取景，未录制到手机。",
+                if (!fullscreen && !compact) Text("监看辅助分析预览画面，不代表 RAW 曝光。请将相机切到照片模式。原片保存到相机存储卡，进入「下载照片」页后再读取列表，可选择下载。画面是实时取景，未录制到手机。",
                     color = Color.LightGray, fontSize = 10.sp, modifier = Modifier.padding(top = 8.dp))
             }
         }
     }
+}
+
+@Composable
+private fun MonitorChip(label: String, selected: Boolean, tag: String, onClick: () -> Unit) {
+    FilterChip(selected = selected, onClick = onClick, label = { Text(label, fontSize = 11.sp) },
+        colors = FilterChipDefaults.filterChipColors(containerColor = Color(0xFF1B2924), labelColor = Color.White,
+            selectedContainerColor = Color(0xFF166554), selectedLabelColor = Color.White), modifier = Modifier.testTag(tag))
 }
 
 @Composable

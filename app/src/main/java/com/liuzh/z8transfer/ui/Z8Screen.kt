@@ -54,6 +54,9 @@ import com.liuzh.z8transfer.AppController
 import com.liuzh.z8transfer.AppState
 import com.liuzh.z8transfer.core.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import com.liuzh.z8transfer.storage.connectionDiagnostics
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -83,7 +86,8 @@ fun Z8Screen(controller: AppController, onConnect: () -> Unit, onDownload: (Bool
     TransferContent(state, onConnect, controller::disconnect, controller::refresh, controller::toggle,
         controller::selectVisible, controller::clearSelection, onDownload, controller::requestStop,
         controller::dismissError, controller::thumbnail, controller::preview, controller::videoPreview, onDelete, onImmersiveChange,
-        controller::connectWifi, onWifiSettings, controller.lastWifiEndpoint(), controller::selectUsbMode, controller::setSelection, controller::focusRegion, controller::openRemote, controller::remoteAction, controller::closeRemote, controller::selectPage)
+        controller::connectWifi, onWifiSettings, controller.lastWifiEndpoint(), controller::selectUsbMode, controller::setSelection, controller::focusRegion, controller::openRemote, controller::remoteAction, controller::closeRemote, controller::selectPage,
+        onMarkSelected = controller::markSelected, onRawJpegModeChange = controller::setRawJpegMode)
 }
 
 @Composable
@@ -102,6 +106,7 @@ internal fun TransferContent(
     focusRegion: suspend (CameraPhoto) -> FocusRegion? = { null },
     onOpenRemote: () -> Unit = {}, onRemoteAction: (RemoteAction) -> Unit = {}, onCloseRemote: () -> Unit = {},
     onPageChange: (CameraPage) -> Unit = {},
+    onMarkSelected: () -> Unit = {}, onRawJpegModeChange: (RawJpegMode) -> Unit = {},
 ) {
     var category by rememberSaveable { mutableStateOf("全部") }
     var card by rememberSaveable { mutableStateOf<Int?>(null) }
@@ -114,16 +119,26 @@ internal fun TransferContent(
     val sort = PhotoSort.valueOf(sortName)
     var wifi by remember { mutableStateOf(false) }
     var info by remember { mutableStateOf(false) }
+    var diagnosticReport by remember { mutableStateOf("") }
+    val context = LocalContext.current
+    LaunchedEffect(info, state.diagnostics) {
+        if (info) diagnosticReport = withContext(Dispatchers.IO) {
+            runCatching { connectionDiagnostics(context, state.diagnostics) }.getOrElse {
+                "部分环境信息读取失败：${it.message}\n\n${state.diagnostics}"
+            }
+        }
+    }
     var report by remember { mutableStateOf(false) }
     var deleteReport by remember { mutableStateOf(false) }
     var deletionPlan by remember { mutableStateOf<DeletionPlan?>(null) }
     var viewing by remember { mutableStateOf<Pair<List<CameraPhoto>, Int>?>(null) }
     val grid = rememberLazyGridState()
     val selected = remember(state.photos, state.selected) { state.photos.filter { it.key in state.selected } }
-    val visible = remember(state.photos, category, card, day, query, sort) {
+    val downloadPlan = remember(selected, state.photos, state.rawJpegMode) { planDownload(selected, state.photos, state.rawJpegMode) }
+    val visible = remember(state.photos, state.marked, category, card, day, query, sort) {
         sort.apply(state.photos.filter { p ->
             (when (category) { "照片" -> p.kind.isPhoto; "视频" -> p.kind.isVideo; "N-RAW" -> p.kind == PhotoKind.NEV;
-                "RAW" -> p.kind == PhotoKind.RAW; "JPEG" -> p.kind == PhotoKind.JPEG;
+                "RAW" -> p.kind == PhotoKind.RAW; "JPEG" -> p.kind == PhotoKind.JPEG; "已标记" -> p.importKey in state.marked;
                 "其他" -> p.kind == PhotoKind.OTHER; else -> true }) &&
                 (card == null || p.storageId == card) && (day == "所有日期" || date(p.sortTime, "yyyy-MM-dd") == day) &&
                 p.name.contains(query, true)
@@ -192,6 +207,7 @@ internal fun TransferContent(
                         if (state.page != CameraPage.HOME) TextButton(onClick = { onPageChange(CameraPage.HOME) },
                             enabled = !state.switchingPage && !state.progress.running && !state.deletion.running) { Text("首页", fontSize = 12.sp) }
                         if (!state.connected) TextButton(onClick = { wifi = true }, enabled = !state.busy) { Text("Wi-Fi 连接", fontSize = 12.sp) }
+                        if (!state.connected) TextButton(onClick = { info = true }) { Text("诊断", fontSize = 12.sp) }
                     }
                     Surface(color = Ink, shape = RoundedCornerShape(17.dp)) {
                         Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -261,7 +277,7 @@ internal fun TransferContent(
                             }
                         }
                         Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                            listOf("全部", "照片", "RAW", "JPEG", "视频", "N-RAW", "其他").forEach { label ->
+                            listOf("全部", "已标记", "照片", "RAW", "JPEG", "视频", "N-RAW", "其他").forEach { label ->
                                 FilterChip(category == label, { category = label }, label = { Text(label, fontSize = 12.sp) })
                             }
                         }
@@ -315,12 +331,13 @@ internal fun TransferContent(
                         horizontalArrangement = Arrangement.spacedBy(if (columns >= 4) 3.dp else 6.dp),
                         verticalArrangement = Arrangement.spacedBy(if (columns >= 4) 4.dp else 8.dp),
                         contentPadding = PaddingValues(start = if (collapsed) 4.dp else 12.dp, end = 40.dp,
-                            top = if (collapsed) 48.dp else 2.dp, bottom = if (hasDock) 144.dp else 16.dp)) {
+                            top = if (collapsed) 48.dp else 2.dp,
+                            bottom = if (hasDock && !state.progress.running && !state.deletion.running) 230.dp else if (hasDock) 144.dp else 16.dp)) {
                         items(visible, key = { it.key }) { file ->
                             FileTile(file, file.key in state.selected, file.key in state.downloaded, state.busy,
                                 state.scanning || state.progress.running || state.deletion.running, thumbnail,
                                 onSelect = { onToggle(file) }, onPreview = { viewing = visible.toList() to visible.indexOf(file) },
-                                compact = columns >= 4)
+                                compact = columns >= 4, marked = file.importKey in state.marked)
                         }
                     }
                     if (visible.size > columns && (grid.canScrollBackward || grid.canScrollForward)) {
@@ -348,14 +365,24 @@ internal fun TransferContent(
                         else -> {
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                                 Text("已选 ${selected.size} 个文件", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
-                                Text(selectionSize(selected), fontSize = 11.sp, color = Muted)
+                                Text(selectionSize(downloadPlan.files), fontSize = 11.sp, color = Muted)
                             }
+                            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), verticalAlignment = Alignment.CenterVertically) {
+                                TextButton(onClick = onMarkSelected, enabled = !state.busy, modifier = Modifier.testTag("mark-selected")) {
+                                    Text(if (selected.all { it.importKey in state.marked }) "取消标记" else "标记选片", fontSize = 12.sp)
+                                }
+                                FilterMenu(state.rawJpegMode.label, RawJpegMode.entries.map { it to it.label }, onRawJpegModeChange)
+                            }
+                            if (state.rawJpegMode != RawJpegMode.SELECTED) Text(
+                                "按同卡同目录配对 · 下载 ${downloadPlan.files.size} 个文件" +
+                                    if (downloadPlan.unmatchedPhotos > 0) " · ${downloadPlan.unmatchedPhotos} 项无对应格式" else "",
+                                fontSize = 10.sp, color = Muted)
                             Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                 OutlinedButton(onClick = { deletionPlan = DeletionPlan(selected.first().sessionId, selected.toList()) },
                                     enabled = state.connected && !state.busy && state.supportsDeletion,
                                     colors = ButtonDefaults.outlinedButtonColors(contentColor = Danger), modifier = Modifier.weight(1f)) { Text("删除相机文件", fontSize = 12.sp) }
-                                Button(onClick = { onDownload(false) }, enabled = state.connected && !state.busy && state.storageReady,
-                                    modifier = Modifier.weight(1.25f)) { Text("下载 ${selected.size} 个原文件", fontSize = 12.sp) }
+                                Button(onClick = { onDownload(false) }, enabled = state.connected && !state.busy && state.storageReady && downloadPlan.files.isNotEmpty(),
+                                    modifier = Modifier.weight(1.25f)) { Text("下载 ${downloadPlan.files.size} 个原文件", fontSize = 12.sp) }
                             }
                             if (!state.supportsDeletion) Text(state.deletionUnavailableReason, fontSize = 10.sp, color = Muted)
                         }
@@ -366,7 +393,7 @@ internal fun TransferContent(
     }
     if (wifi) WifiConnectionDialog(!state.busy, wifiEndpoint, onWifiSettings,
         onConnect = { endpoint -> wifi = false; onWifiConnect(endpoint) }, onDismiss = { wifi = false })
-    if (info) BasicDialog("连接信息", state.diagnostics.ifBlank { "相机尚未连接" }) { info = false }
+    if (info) BasicDialog("连接信息", diagnosticReport.ifBlank { "正在读取本机连接环境…" }) { info = false }
     if (report) ReportDialog(state.progress, { report = false }, if (state.connected && !state.busy && state.progress.failed > 0) {
         { report = false; onDownload(true) }
     } else null)
@@ -393,7 +420,8 @@ internal fun TransferContent(
 
 @Composable
 private fun FileTile(file: CameraPhoto, selected: Boolean, downloaded: Boolean, busy: Boolean, paused: Boolean,
-    thumbnail: suspend (CameraPhoto) -> Bitmap?, onSelect: () -> Unit, onPreview: () -> Unit, compact: Boolean = false) {
+    thumbnail: suspend (CameraPhoto) -> Bitmap?, onSelect: () -> Unit, onPreview: () -> Unit, compact: Boolean = false,
+    marked: Boolean = false) {
     var bitmap by remember(file.key) { mutableStateOf<Bitmap?>(null) }
     LaunchedEffect(file.key, paused) { if (!paused && bitmap == null) bitmap = thumbnail(file) }
     Column(Modifier.clip(RoundedCornerShape(13.dp)).background(Color.White)
@@ -410,6 +438,9 @@ private fun FileTile(file: CameraPhoto, selected: Boolean, downloaded: Boolean, 
                     modifier = Modifier.align(Alignment.TopEnd).size(if (compact) 24.dp else 48.dp).background(Color.White.copy(alpha = 0.9f), RoundedCornerShape(bottomStart = 12.dp))
                         .semantics { contentDescription = "选择 ${file.name}" })
             }
+            if (marked) Text("★", color = Color(0xFFFFD54F), fontSize = if (compact) 14.sp else 23.sp,
+                modifier = Modifier.align(Alignment.BottomStart).background(Ink.copy(alpha = .8f)).padding(horizontal = 4.dp)
+                    .semantics { contentDescription = "已标记 ${file.name}" })
         }
         Column(Modifier.padding(if (compact) 3.dp else 9.dp)) {
             Text(file.name, fontSize = if (compact) 8.sp else 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
